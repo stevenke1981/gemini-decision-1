@@ -1,0 +1,8 @@
+node_modules/
+.gemini-test/
+.env
+.env.local
+.env.*.local
+*.jsonl
+.sites-runtime/
+gemini-core.config.user.json

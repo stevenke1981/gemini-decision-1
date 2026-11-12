@@ -1,0 +1,24 @@
+{
+  "name": "gemini-decision-1",
+  "version": "0.1.0",
+  "description": "A Gemini Decision 1 layer for model routing, skills, retrieval, memory and context compression.",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/stevenke1981/gemini-decision-1.git"
+  },
+  "homepage": "https://github.com/stevenke1981/gemini-decision-1#readme",
+  "bugs": {
+    "url": "https://github.com/stevenke1981/gemini-decision-1/issues"
+  },
+  "bin": {
+    "gemini-core": "bin/gemini-core.js"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "license": "MIT"
+}
