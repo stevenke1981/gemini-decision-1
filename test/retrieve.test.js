@@ -60,6 +60,19 @@ test('normalize rejects bad input and returns a new object with the defaults app
   throwsType(() => normalize({ query: 'x', root: 3 }, cfg), /root must be a non-empty string/);
 }));
 
+test('prepare: a root that is a file or does not exist is an InputError when the index refuses it; another build error passes through', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const file = path.join(dir, 'notes.txt');
+  fs.writeFileSync(file, 'x');
+  const refuse = { repoIndex: (root) => { throw new Error(`createRepoIndex: not a folder: ${root}`); } };
+  for (const root of [file, path.join(dir, 'missing')]) {
+    await assert.rejects(prepare(normalize({ query: 'q', root }, cfg), cfg, refuse),
+      (err) => err.name === 'InputError' && err.code === 'INVALID_INPUT' && /is not a folder/.test(err.message) && err.cause instanceof Error);
+  }
+  const broken = { repoIndex: () => { throw new Error('disk on fire'); } };
+  await assert.rejects(prepare(normalize({ query: 'q', root: dir }, cfg), cfg, broken), (err) => err.message === 'disk on fire' && err.code === undefined);
+}));
+
 test('prepare fills candidates from the repository index only when they are absent and a root is given', () => withDir(async (dir) => {
   const cfg = cfgFor(dir, { allowedRoots: [dir] });
   const repo = path.join(dir, 'repo');

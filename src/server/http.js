@@ -1,6 +1,6 @@
 // The HTTP JSON sidecar (docs/design.md §6): `GET /health`, `POST /v1/decide/:kind` and
 // `GET /v1/stats`, bound to loopback by default. Status codes: 200 ok; 400 a body that is not JSON
-// or an input the kind's normalize or the engine's prepare rejects (a TypeError); 404 an unknown
+// or an input the kind's normalize or the engine's prepare rejects (an InputError); 404 an unknown
 // route or kind; 413 a body over server.maxBodyBytes; 403 a browser Origin or, on a loopback server, a
 // foreign Host header (DNS rebinding); 415 a non-JSON content type; 502 a strict Gemini failure;
 // 500 anything else. Every message
@@ -8,6 +8,7 @@
 import http from 'node:http';
 import { scrub } from '../contract.js';
 import { decisionErrorCode, isGeminiFailure } from '../engine.js';
+import { InputError } from '../errors.js';
 import { DEFAULTS, KINDS } from '../defaults.js';
 import { KIND_MODULES } from '../registry.js';
 import { VERSION } from '../version.js';
@@ -97,11 +98,14 @@ function decodeKind(raw) {
   }
 }
 
-/** The status of a failed decision: a TypeError that is not a Gemini failure is bad input (400). */
+/**
+ * The status of a failed decision: an InputError is the caller's mistake (400). Any other
+ * TypeError is a fault of the program and is answered 500 like every other failure.
+ */
 function failureStatus(err, code) {
   if (isGeminiFailure(err)) return STATUS.UPSTREAM;
   if (code === 'ESCALATION_EXHAUSTED') return STATUS.UNPROCESSABLE;
-  return err instanceof TypeError ? STATUS.BAD_INPUT : STATUS.SERVER;
+  return err instanceof InputError ? STATUS.BAD_INPUT : STATUS.SERVER;
 }
 
 /** A failed decision: 502 in strict mode (a Gemini failure), 500 otherwise. Logged, then answered. */

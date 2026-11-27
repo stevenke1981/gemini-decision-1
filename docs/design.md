@@ -40,7 +40,8 @@ a Gemini failure fails the decision), `heuristic` (rules only, no network).
 
 `engine.decide(kind, input)`:
 
-1. `input = mod.normalize(input, cfg)` — TypeError on bad input (never falls back).
+1. `input = mod.normalize(input, cfg)` — TypeError on bad input (never falls back); the engine
+   rethrows it as an `InputError` (a TypeError with code `INVALID_INPUT`), as it does an unknown kind.
 2. `input = await mod.prepare?.(input, cfg, deps)` — IO (catalog scan, index search, store search).
 3. mode `heuristic` → `v = mod.heuristic(input, cfg)`, source `rules`.
 4. else `p = mod.plan(input, cfg)`. `p.settled` → source `settled`, no call.
@@ -287,7 +288,8 @@ CLI (JSON to stdout, errors to stderr, exit 1 on error, 2 on usage):
 tokens), `route --task T [--context-tokens N] [--requires a,b] [--local-only]`, `skills --task T
 [--dir D ...]`, `retrieve --query Q [--root R] [--budget N] [--force]`, `recall --query Q`,
 `remember --text T [--source user] [--dry-run]`, `compress --file transcript.json` (input object
-JSON), `memories` (every stored memory), `forget --id ID` (remove one; exit 1 when unknown),
+JSON), `memories` (every stored memory), `forget --id ID [--purge]` (remove one; exit 1 when unknown;
+`--purge` also erases its history entries), `purge-history [--id ID]` (erase history entries),
 `serve [--port N]`, `mcp`, `config` (effective config without the key), `--mode`,
 `--config`, `--version`, `--help`. Loads env files first.
 
@@ -296,7 +298,9 @@ HTTP: `GET /health` → `{ok, version, mode}`; `POST /v1/decide/:kind` JSON body
 Decision requests require `Content-Type: application/json` (charset parameters accepted),
 otherwise 415. When bound to loopback, a `Host` header naming any other host is also answered 403
 (DNS rebinding); the check follows the address the socket actually binds, not `server.host`, so a
-`startHttp` host override changes it, and it stays on until the server is listening. Body limit `server.maxBodyBytes`, default 8 MB (413); 400 on bad JSON/invalid input, 404 unknown route,
+`startHttp` host override changes it, and it stays on until the server is listening. Body limit `server.maxBodyBytes`, default 8 MB (413); 400 on bad JSON/invalid input (what `normalize` rejects, or an `InputError` from the
+engine such as a root outside the allowed folders or one that is not a folder; any other
+TypeError is a fault of the program and answers 500), 404 unknown route,
 502 on a strict-mode Gemini error, 500 on local IO/other failures in every mode.
 
 MCP (stdio, JSON-RPC 2.0, newline-delimited, protocol `2025-06-18`): `initialize`,
@@ -327,7 +331,8 @@ the stored text).
 - `createRepoIndexAsync` builds the same index while yielding to the event loop; the engine uses
   it, concurrent requests for one root share one build, and a failed build is not cached.
 - Memory writes are flushed before the rename; `update` and `remove` append the prior record to
-  `<file>.history`; a lock is released only by the process whose token it holds; the store, its
+  `<file>.history`, and `purgeHistory([id])` erases those entries (all, or one record's) under
+  the same lock; a lock is released only by the process whose token it holds; the store, its
   side files and the ledger are created owner-only (0600) on POSIX.
 - The ledger rotates to `<file>.1` past `ledger.maxBytes` (default 10 MB). The full file is first
   moved aside under a private name and replaces `<file>.1` only if it is still over the limit, so

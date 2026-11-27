@@ -10,6 +10,7 @@ import path from 'node:path';
 import { createEngine } from '../src/engine.js';
 import { loadConfig } from '../src/config.js';
 import { createHttpServer, startHttp, scrubSecrets, isLoopbackHost, BODY_LIMIT_BYTES } from '../src/server/http.js';
+import { InputError } from '../src/errors.js';
 import { VERSION } from '../src/version.js';
 import { fakeGemini } from './helpers/fakeGemini.js';
 
@@ -409,12 +410,13 @@ test('a config without maxBodyBytes still enforces the default limit, and an inv
   }
 });
 
-test('a TypeError the engine throws after validation is 400 INVALID_INPUT; another error stays 500', async () => {
+test('an InputError the engine throws after validation is 400 INVALID_INPUT; a plain TypeError and any other error are 500', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-http-'));
   try {
     const config = loadConfig({ env: { GEMINI_CORE_HOME: home }, cwd: home, overrides: { mode: 'heuristic' } });
     const cases = [
-      [new TypeError('root is outside the allowed folders'), 400],
+      [new InputError('root is outside the allowed folders'), 400],
+      [new TypeError("Cannot read properties of undefined (reading 'models')"), 500],
       [new Error('disk on fire'), 500],
     ];
     for (const [error, status] of cases) {
@@ -426,7 +428,7 @@ test('a TypeError the engine throws after validation is 400 INVALID_INPUT; anoth
         const body = await res.json();
         assert.equal(body.ok, false);
         assert.equal(body.error, error.message);
-        if (status === 400) assert.equal(body.errorCode, 'INVALID_INPUT');
+        assert.equal(body.errorCode, status === 400 ? 'INVALID_INPUT' : 'INTERNAL_ERROR');
       } finally {
         server.closeAllConnections();
         await new Promise((resolve) => server.close(resolve));

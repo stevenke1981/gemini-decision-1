@@ -172,9 +172,16 @@ gemini-core memories
 
 # 依 id 刪除一筆；id 不存在時結束碼為 1
 gemini-core forget --id m_0123456789
+
+# 刪除並一併清掉它留在歷史檔裡的舊內容
+gemini-core forget --id m_0123456789 --purge
+
+# 清掉歷史檔：全部，或只清某一筆（已刪除的記憶也可以）
+gemini-core purge-history
+gemini-core purge-history --id m_0123456789
 ```
 
-被更新或刪除的記憶，其舊內容會附加到記憶檔旁的 `memory.jsonl.history`（每行一筆 `{ at, op, record }`），誤刪時可從這裡找回。這個檔案只增不減，工具本身不會讀它。
+被更新或刪除的記憶，其舊內容會附加到記憶檔旁的 `memory.jsonl.history`（每行一筆 `{ at, op, record }`），誤刪時可從這裡找回。工具本身不會讀它，所以只用 `forget` 刪除時文字仍留在這個檔案裡；要真正移除請加 `--purge` 或執行 `purge-history`（移除的是檔案中的該幾行，不會覆寫磁碟區塊）。
 
 ### 壓縮上下文
 

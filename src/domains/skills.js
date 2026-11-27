@@ -3,6 +3,7 @@
 // description. In `auto` mode Gemini answers one predicate per shortlisted skill; the rules
 // (`heuristic`) keep the lexical leaders instead. See docs/design.md §4.2.
 import path from 'node:path';
+import { InputError } from '../errors.js';
 import { isWithin, realWithinAny } from '../paths.js';
 import { createBm25, excerpt } from '../text.js';
 import { verdict, certainty, mean, indexId, redact } from '../contract.js';
@@ -23,7 +24,7 @@ const WORD_CHARS = 'A-Za-z0-9_-';
 // bare; a plain word such as "testing" or "plan" is ordinary prose and is left to Gemini.
 const DISTINCTIVE = /[-:]/;
 
-const fail = (msg) => new TypeError(`skills: ${msg}`);
+const fail = (msg) => new InputError(`skills: ${msg}`);
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isPositiveInt = (v) => Number.isInteger(v) && v > 0;
 const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

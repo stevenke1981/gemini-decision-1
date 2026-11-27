@@ -7,7 +7,8 @@
 // skipped lines to `<file>.rejected` first. A text that looks like a secret (contract SECRET) is
 // refused on the way in and skipped on the way out, and a skipped line that holds one keeps no text
 // in `.rejected`. Before `update` or `remove` rewrites the file, the record as it was is appended
-// to `<file>.history` as `{ at, op, record }`; the history is append-only and never read back.
+// to `<file>.history` as `{ at, op, record }`; the history is never read back by the store, and
+// only `purgeHistory` removes entries from it.
 // Every read-modify-write holds `<file>.lock` (created exclusively), so several processes on one
 // store do not lose each other's records. A lock older than LOCK_STALE_MS is taken to be left by a
 // dead process and is removed. The lock file holds a token of its holder, and a holder removes the
@@ -293,9 +294,13 @@ function mutate(file, stamp, change) {
  * Call under the lock.
  */
 function writeRecords(file, records) {
+  writeAtomic(file, records.map((r) => `${JSON.stringify(r)}\n`).join(''));
+}
+
+/** Writes `body` to a temp file beside `file`, flushes it, then renames it over `file`. */
+function writeAtomic(file, body) {
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
-  const body = records.map((r) => `${JSON.stringify(r)}\n`).join('');
   let fd;
   try {
     fd = fs.openSync(tmp, 'wx', PRIVATE_MODE);
@@ -317,6 +322,42 @@ function writeRecords(file, records) {
     }
     throw err;
   }
+}
+
+/** The record id of a history line, or null when the line is not a history entry. */
+function historyId(line) {
+  try {
+    return JSON.parse(line)?.record?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Erases entries from `<file>.history` under the store lock: every line, or with an `id` only the
+ * entries of that record (a line that cannot be read is then kept, since it cannot be matched).
+ * The kept lines replace the file through a temp file; with none left the file is removed.
+ * The erased text is unlinked, not overwritten on the disk.
+ * @returns {number} the number of lines erased
+ */
+function purgeHistoryFile(file, id) {
+  const historyFile = `${file}${HISTORY_SUFFIX}`;
+  return withLock(file, () => {
+    let text;
+    try {
+      text = fs.readFileSync(historyFile, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return 0;
+      throw err;
+    }
+    const lines = text.split('\n').filter((line) => line.trim());
+    const kept = id === undefined ? [] : lines.filter((line) => historyId(line) !== id);
+    const erased = lines.length - kept.length;
+    if (erased === 0) return 0;
+    if (kept.length === 0) retryBusy(() => fs.rmSync(historyFile, { force: true }));
+    else writeAtomic(historyFile, kept.map((line) => `${line}\n`).join(''));
+    return erased;
+  });
 }
 
 function newId(records) {
@@ -398,6 +439,14 @@ export function createMemoryStore(file, { now = () => new Date() } = {}) {
         const history = [{ op: 'remove', record: copy(records.find((r) => r.id === id)) }];
         return { records: records.filter((r) => r.id !== id), result: true, history };
       });
+    },
+    /**
+     * Erases the earlier versions kept in `<file>.history`: all of them, or only those of the
+     * record `id` (stored or already removed). Returns how many entries were erased.
+     */
+    purgeHistory(id) {
+      if (id !== undefined && (typeof id !== 'string' || !id.trim())) throw new TypeError('memory: id must be a non-empty string');
+      return purgeHistoryFile(file, id);
     },
   });
 }

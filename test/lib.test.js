@@ -13,6 +13,8 @@ test('the library entry exports the public functions and the error class', () =>
   }
   assert.equal(typeof lib.DecisionError, 'function');
   assert.ok(lib.DecisionError.prototype instanceof Error);
+  assert.ok(lib.InputError.prototype instanceof TypeError);
+  assert.equal(new lib.InputError('x').code, 'INVALID_INPUT');
 });
 
 test('the library entry exports VERSION as the package.json version', () => {

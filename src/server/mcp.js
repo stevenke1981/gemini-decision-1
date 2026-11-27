@@ -212,7 +212,7 @@ async function callTool(params, ctx) {
   } catch (err) {
     return toolResult({
       error: scrubSecrets(err?.message ?? err, ctx.secrets),
-      errorCode: decisionErrorCode(err, err instanceof TypeError ? 'INVALID_INPUT' : 'INTERNAL_ERROR'),
+      errorCode: decisionErrorCode(err, 'INTERNAL_ERROR'),
     }, true);
   }
 }

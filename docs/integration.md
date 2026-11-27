@@ -185,7 +185,7 @@ console.log(route.result.model, route.result.effort, route.source);
 | 狀態碼 | 意義 | 呼叫端建議 |
 |---|---|---|
 | `200` | 成功。在 `auto` 模式下，Gemini 出錯時仍回 200，並以規則結果回傳，`error` 欄位說明原因 | 讀取 `error`，記錄為降級 |
-| `400` | JSON 格式錯誤，或輸入不合法（`TypeError`） | 修正請求，不要重試同一筆 |
+| `400` | JSON 格式錯誤，或輸入不合法（`InputError`，`errorCode` 為 `INVALID_INPUT`；包含檢索根目錄不在允許範圍或不是資料夾） | 修正請求，不要重試同一筆 |
 | `403` | 請求帶有瀏覽器 `Origin` 標頭，或服務綁定 loopback 時 `Host` 標頭不是 loopback 主機 | 從伺服器端 harness 以 `127.0.0.1` 或 `localhost` 呼叫服務 |
 | `404` | 未知路徑（例如未知 kind） | 修正路徑 |
 | `413` | 請求本體超過 `server.maxBodyBytes`（預設 8 MB） | 縮小輸入，或在設定檔調高上限 |
