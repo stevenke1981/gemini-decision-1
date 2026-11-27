@@ -14,6 +14,20 @@
   "bin": {
     "gemini-core": "bin/gemini-core.js"
   },
+  "exports": {
+    ".": "./src/lib.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "examples",
+    "README.md",
+    "LICENSE",
+    ".env.example",
+    "gemini-core.config.example.json"
+  ],
   "scripts": {
     "test": "node --test \"test/**/*.test.js\""
   },

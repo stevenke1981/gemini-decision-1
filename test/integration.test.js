@@ -14,7 +14,7 @@ import { fakeGemini } from './helpers/fakeGemini.js';
 const KEY = 'sk-abcdefghijklmnopqrstuvwxyz123456';
 
 function fixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-int-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-int-'));
   const skills = path.join(dir, 'skills');
   for (const [name, description] of [['rust-testing', 'Write and run Rust unit tests with cargo test'], ['frontend-design', 'Design web pages, CSS and layout']]) {
     fs.mkdirSync(path.join(skills, name), { recursive: true });

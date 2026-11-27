@@ -90,7 +90,8 @@ test('the same route input produces matching SDK, HTTP, MCP and CLI results and 
     fs.writeFileSync(path.join(cwd, 'route.json'), JSON.stringify(input));
     let stdout = '';
     let stderr = '';
-    const exit = await main(['route', '--input-json', 'route.json'], {
+    // The same explicit config file the engine was loaded from (a working-folder config may not set ledger.enabled).
+    const exit = await main(['route', '--config', 'gemini-core.config.json', '--input-json', 'route.json'], {
       cwd, env, stdout: { write: (s) => { stdout += s; } }, stderr: { write: (s) => { stderr += s; } },
     });
     return { exit, stdout, stderr };

@@ -18,12 +18,12 @@ const LONG_TASK_CHARS = 600;
 const STUCK_STREAK = 3;
 const TWO_IN_A_ROW = 2;
 const ONE_IN_A_ROW = 1;
-// Ladder indexes used by the rules (the default ladder is low, medium, high, xhigh, max).
-const LEVEL_GREETING = 0;
-const LEVEL_ROUTINE = 1;
-const LEVEL_HARD = 2;
-// From this ladder index on, the rules take the strongest eligible model.
-const MODEL_TOP_LEVEL = 3;
+// The target efforts the rules aim for, by name; difficulty maps them onto the configured ladder.
+const EFFORT_GREETING = 'low';
+const EFFORT_ROUTINE = 'medium';
+const EFFORT_HARD = 'high';
+// From this target effort on (or when stuck), the rules take the strongest eligible model.
+const EFFORT_TOP_MODEL = 'xhigh';
 
 // One description per effort, used as the level descriptions of the effort score question.
 const EFFORT_DESCRIPTIONS = Object.freeze({
@@ -374,27 +374,53 @@ function interpret(answers, ctx, cfg) {
   return verdict(result, confidence, interpretReasons(picked, asked, chosen, cfg));
 }
 
-// The ladder index the rules give a request, with the reason in words.
-function difficulty(input, cfg) {
-  const top = cfg.ladder.length - 1;
-  const at = (level, reason) => ({ level: Math.min(level, top), reason });
-  if (GREETING.test(input.task)) return at(LEVEL_GREETING, 'greeting');
-  const steps = input.attempts === undefined ? input.steps : [];
-  const streak = failureStreak(steps);
-  if (streak >= STUCK_STREAK) return at(top, `${streak} failures in a row`);
-  if (repeatsFailure(steps)) return at(top, 'the same failing command repeated');
-  if (streak === TWO_IN_A_ROW) return at(LEVEL_HARD, 'two failures in a row');
-  const hard = isHardTask(input.task);
-  const reason = hard ? 'hard or long task' : 'routine task';
-  return at(hard ? LEVEL_HARD : LEVEL_ROUTINE, streak === ONE_IN_A_ROW ? `first failure; ${reason}` : reason);
+/**
+ * The ladder entry nearest to `target` by rank in EFFORTS. A tie goes up when `up`, else down.
+ * @param {string} target one of EFFORTS
+ * @param {string[]} ladder strictly increasing efforts
+ * @param {boolean} up break ties toward more effort
+ * @returns {string}
+ */
+function nearestOnLadder(target, ladder, up) {
+  const at = effortRank(target);
+  let best = null;
+  for (const effort of ladder) {
+    const rank = effortRank(effort);
+    const dist = Math.abs(rank - at);
+    if (!best || dist < best.dist || (dist === best.dist && up && rank > best.rank)) best = { effort, rank, dist };
+  }
+  return best.effort;
 }
 
-// The eligible model for a ladder index: the first below level 2, the middle at level 2, the last from 3.
-function modelAtLevel(eligible, level) {
+/**
+ * The effort the rules give a request: a target effort by name (or the top of the ladder when
+ * stuck), mapped onto the ladder; a tie goes up during a failure streak, else down.
+ * @returns {{effort:string, target:string, stuck:boolean, reason:string}}
+ */
+function difficulty(input, cfg) {
+  const steps = input.attempts === undefined ? input.steps : [];
+  const streak = failureStreak(steps);
+  const aim = (target, reason, stuck = false) => ({ effort: nearestOnLadder(target, cfg.ladder, streak > 0), target, stuck, reason });
+  if (GREETING.test(input.task)) return aim(EFFORT_GREETING, 'greeting');
+  const top = cfg.ladder.at(-1);
+  if (streak >= STUCK_STREAK) return aim(top, `${streak} failures in a row`, true);
+  if (repeatsFailure(steps)) return aim(top, 'the same failing command repeated', true);
+  if (streak === TWO_IN_A_ROW) return aim(EFFORT_HARD, 'two failures in a row');
+  const hard = isHardTask(input.task);
+  const reason = hard ? 'hard or long task' : 'routine task';
+  return aim(hard ? EFFORT_HARD : EFFORT_ROUTINE, streak === ONE_IN_A_ROW ? `first failure; ${reason}` : reason);
+}
+
+/**
+ * The eligible model for a difficulty, by its target effort: the first below 'high', the middle
+ * (floor(last / 2)) from 'high', the last from EFFORT_TOP_MODEL or when stuck.
+ */
+function modelFor(eligible, { target, stuck }) {
   const last = eligible.length - 1;
-  if (level <= LEVEL_ROUTINE) return eligible[0];
-  if (level < MODEL_TOP_LEVEL) return eligible[Math.floor(last / 2)];
-  return eligible[last];
+  const rank = effortRank(target);
+  if (stuck || rank >= effortRank(EFFORT_TOP_MODEL)) return eligible[last];
+  if (rank >= effortRank(EFFORT_HARD)) return eligible[Math.floor(last / 2)];
+  return eligible[0];
 }
 
 /** The rules' answer, for when Gemini is unavailable or abstains. Same shape as interpret. */
@@ -402,13 +428,14 @@ function heuristic(input, cfg) {
   const eligible = eligibleOrThrow(input, cfg);
   const policy = policyRoute(input, eligible, cfg);
   if (policy) return policy;
-  const { level, reason } = difficulty(input, cfg);
-  const model = modelAtLevel(eligible, level);
-  const asked = cfg.ladder[level];
+  const rated = difficulty(input, cfg);
+  const model = modelFor(eligible, rated);
+  const asked = rated.effort;
   const failing = input.attempts === undefined && (failureStreak(input.steps) > 0 || repeatsFailure(input.steps));
   const effort = failing ? minimumEffort(model.efforts, effortRank(asked)) : clampEffort(asked, model.efforts);
   if (!effort) return promotion(eligible, model.tier, effortRank(asked), cfg);
-  const reasons = [reason, `model ${model.id}`];
+  const reasons = [rated.reason, `model ${model.id}`];
+  if (asked !== rated.target) reasons.push(`target effort ${rated.target} mapped to ${asked} on the ladder`);
   if (effort !== asked) reasons.push(`effort ${asked} clamped to ${effort} for ${model.id}`);
   return verdict(resultFor(eligible, model, effort, {}), null, reasons);
 }
@@ -433,7 +460,7 @@ function gate(gemini, rules, input, cfg) {
   const geminiModel = findModel(eligible, gemini.result.model);
   const ruleModel = findModel(eligible, rules.result.model);
   let model = ruleModel.tier > geminiModel.tier ? ruleModel : geminiModel;
-  const floor = cfg.ladder[difficulty(input, cfg).level];
+  const floor = difficulty(input, cfg).effort;
   const minimumRank = effortRank(higherEffort(floor, higherEffort(gemini.result.effort, rules.result.effort)));
   let effort = minimumEffort(model.efforts, minimumRank);
   if (!effort) {

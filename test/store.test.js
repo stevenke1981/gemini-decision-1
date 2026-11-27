@@ -13,7 +13,7 @@ const FILE = 'memory.jsonl';
 
 /** Runs `fn` with a fresh folder, removed afterwards. */
 function withDir(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-store-'));
   try {
     return fn(dir);
   } finally {
@@ -23,7 +23,7 @@ function withDir(fn) {
 
 /** As withDir, for a callback that awaits (child processes). */
 async function withDirAsync(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-store-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-store-'));
   try {
     return await fn(dir);
   } finally {
@@ -505,5 +505,138 @@ test('reading, and a remove that finds nothing, leave the skipped lines in place
     store.add({ type: 'user', text: 'Two' });
     assert.deepEqual(readJsonl(`${file}.rejected`).map((e) => e.raw), [bad]);
     assert.deepEqual(store.list().map((r) => r.text), ['One', 'Two']);
+  });
+});
+
+// ------------------------------------------------ history, fsync, lock token, private files
+
+const POSIX_ONLY = { skip: process.platform === 'win32' && 'file modes are not enforced on Windows' };
+const PRIVATE = 0o600;
+
+/** The permission bits of a file. */
+const modeOf = (file) => fs.statSync(file).mode & 0o777;
+
+test('update and remove append the record as it was to memory.jsonl.history; add writes none', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const store = storeIn(dir);
+    const a = store.add({ type: 'user', text: 'Old fact' });
+    const b = store.add({ type: 'user', text: 'Doomed fact' });
+    assert.equal(fs.existsSync(`${file}.history`), false);
+    const later = storeIn(dir, () => LATER);
+    later.update(a.id, { text: 'New fact' });
+    later.remove(b.id);
+    assert.deepEqual(readJsonl(`${file}.history`), [
+      { at: LATER.toISOString(), op: 'update', record: a },
+      { at: LATER.toISOString(), op: 'remove', record: b },
+    ]);
+    assert.deepEqual(later.warnings, [], 'the history is never read by the store');
+  });
+});
+
+test('a remove of an unknown id writes no history, and the history is written before the store is replaced', (t) => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const store = storeIn(dir);
+    const rec = store.add({ type: 'user', text: 'Keep me' });
+    assert.equal(store.remove('m_0000000000'), false);
+    assert.equal(fs.existsSync(`${file}.history`), false);
+    t.mock.method(fs, 'renameSync', () => {
+      throw new Error('rename refused');
+    });
+    assert.throws(() => store.update(rec.id, { text: 'Changed' }), /rename refused/);
+    assert.deepEqual(readJsonl(`${file}.history`).map((e) => e.record.text), ['Keep me']);
+  });
+});
+
+test('the temp file is flushed with fsync before it is renamed', (t) => {
+  withDir((dir) => {
+    const order = [];
+    const realFsync = fs.fsyncSync;
+    const realRename = fs.renameSync;
+    t.mock.method(fs, 'fsyncSync', (fd) => {
+      order.push('fsync');
+      return realFsync(fd);
+    });
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      order.push('rename');
+      return realRename(from, to);
+    });
+    storeIn(dir).add({ type: 'user', text: 'Durable' });
+    assert.deepEqual(order, ['fsync', 'rename']);
+  });
+});
+
+test('a failure while flushing removes the temp file and rethrows', (t) => {
+  withDir((dir) => {
+    t.mock.method(fs, 'fsyncSync', () => {
+      throw new Error('disk gone');
+    });
+    assert.throws(() => storeIn(dir).add({ type: 'user', text: 'Not durable' }), /disk gone/);
+    assert.deepEqual(fs.readdirSync(dir), []);
+  });
+});
+
+test('the lock file holds a token while held, and is removed on release', (t) => {
+  withDir((dir) => {
+    const lock = path.join(dir, `${FILE}.lock`);
+    const realRename = fs.renameSync;
+    let held;
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      held = fs.readFileSync(lock, 'utf8');
+      return realRename(from, to);
+    });
+    storeIn(dir).add({ type: 'user', text: 'Token check' });
+    assert.ok(held.length > 0);
+    assert.equal(fs.existsSync(lock), false);
+  });
+});
+
+test('a lock that another process took over (another token) is left alone on release', (t) => {
+  withDir((dir) => {
+    const lock = path.join(dir, `${FILE}.lock`);
+    const realRename = fs.renameSync;
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      fs.writeFileSync(lock, 'other-holder-token'); // in place: our handle stays open
+      return realRename(from, to);
+    });
+    storeIn(dir).add({ type: 'user', text: 'Slow holder' });
+    assert.equal(fs.readFileSync(lock, 'utf8'), 'other-holder-token');
+  });
+});
+
+test('a lock file that is already gone on release is not an error', (t) => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const lock = `${file}.lock`;
+    const realClose = fs.closeSync;
+    t.mock.method(fs, 'closeSync', (fd) => {
+      realClose(fd);
+      if (fs.existsSync(file)) fs.rmSync(lock, { force: true }); // the store is written: this is the lock close
+    });
+    assert.doesNotThrow(() => storeIn(dir).add({ type: 'user', text: 'Lock removed meanwhile' }));
+    assert.equal(fs.existsSync(lock), false);
+  });
+});
+
+test('every file the store creates is private (0o600)', POSIX_ONLY, (t) => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const lock = `${file}.lock`;
+    const realRename = fs.renameSync;
+    const modes = {};
+    t.mock.method(fs, 'renameSync', (from, to) => {
+      modes.lock = modeOf(lock);
+      modes.tmp = modeOf(from);
+      return realRename(from, to);
+    });
+    fs.writeFileSync(file, `${line('m_aaaaaaaaaa', 'One')}\n{"id": broken\n`);
+    const store = storeIn(dir);
+    const rec = store.add({ type: 'user', text: 'Two' });
+    store.update(rec.id, { text: 'Three' });
+    assert.deepEqual(modes, { lock: PRIVATE, tmp: PRIVATE });
+    assert.equal(modeOf(file), PRIVATE);
+    assert.equal(modeOf(`${file}.rejected`), PRIVATE);
+    assert.equal(modeOf(`${file}.history`), PRIVATE);
   });
 });

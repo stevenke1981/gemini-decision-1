@@ -85,7 +85,7 @@ test('SECRET catches keys and passwords but not ordinary text', () => {
 });
 
 test('loadConfig merges file and env, takes the key from env only, and validates', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-'));
   try {
     fs.writeFileSync(path.join(dir, 'gemini-core.config.json'), JSON.stringify({ mode: 'heuristic', skills: { maxSkills: 2 } }));
     const c = loadConfig({ env: { GEMINI_CORE_HOME: dir, GOOGLE_API_KEY: 'sk-test', GEMINI_DECISION_TIMEOUT_MS: '900' }, cwd: dir });
@@ -188,7 +188,7 @@ test('postDecision pauses after a timeout and reports the pause', async () => {
 });
 
 test('loadConfig refuses a config file that is not JSON or not an object', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-cfg-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-cfg-'));
   try {
     fs.writeFileSync(path.join(dir, 'gemini-core.config.json'), '{ not json');
     assert.throws(() => loadConfig({ env: { GEMINI_CORE_HOME: dir }, cwd: dir }), /is not valid JSON/);
@@ -229,3 +229,103 @@ test('postDecision applies an HTTP-date cooldown and preserves the rate-limit co
     resetGeminiState();
   }
 });
+
+const cfgEnv = (dir) => ({ GEMINI_CORE_HOME: dir });
+
+function withCfgDir(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-cfg-'));
+  try {
+    return fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('loadConfig refuses an unknown key at the top level and in every section, in a file and in overrides', () => withCfgDir((dir) => {
+  const fromFile = (body) => {
+    const file = path.join(dir, 'c.json');
+    fs.writeFileSync(file, JSON.stringify(body));
+    return () => loadConfig({ env: cfgEnv(dir), cwd: dir, file });
+  };
+  assert.throws(fromFile({ minConfidnce: 0.9 }), (e) => /unknown key "minConfidnce"/.test(e.message) && e.message.includes('c.json'));
+  assert.throws(fromFile({ route: { contextHeadrom: 1 } }), /unknown key "route.contextHeadrom"/);
+  assert.throws(fromFile({ server: { prot: 1 } }), /unknown key "server.prot"/);
+  assert.throws(fromFile({ route: { models: [{ id: 'a', tier: 1, contextWindow: 1, efforts: ['low'], tpyo: 1 }] } }), /route\.models\[0\]\.tpyo/);
+  assert.throws(fromFile({ route: { start: { model: 'x', effort: 'low', extra: 1 } } }), /route\.start\.extra/);
+  assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { minConfidnce: 0.9 } }), /unknown key "minConfidnce"/);
+  assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { skills: { dirz: [] } } }), /unknown key "skills.dirz"/);
+}));
+
+test('the shipped example configs still load', () => withCfgDir((dir) => {
+  for (const file of ['gemini-core.config.example.json', 'examples/codex.config.json']) {
+    loadConfig({ env: cfgEnv(dir), cwd: dir, file: path.resolve(file) });
+  }
+}));
+
+const BAD_VALUES = [
+  ['gemini.model', { gemini: { model: '' } }],
+  ['route.contextHeadroom', { route: { contextHeadroom: 'lots' } }],
+  ['route.contextHeadroom', { route: { contextHeadroom: 0.5 } }],
+  ['skills.dirs', { skills: { dirs: 7 } }],
+  ['skills.dirs', { skills: { dirs: [''] } }],
+  ['memory', { memory: { shortlist: 0 } }],
+  ['memory', { memory: { maxRecall: 1.5 } }],
+  ['retrieve', { retrieve: { maxFileBytes: 0 } }],
+  ['retrieve', { retrieve: { maxFiles: 'many' } }],
+  ['retrieve', { retrieve: { excerptChars: -1 } }],
+  ['retrieve.extensions', { retrieve: { extensions: ['js'] } }],
+  ['retrieve.ignoreDirs', { retrieve: { ignoreDirs: [1] } }],
+  ['ledger.enabled', { ledger: { enabled: 'no' } }],
+  ['server.host', { server: { host: '' } }],
+  ['server.maxBodyBytes', { server: { maxBodyBytes: 0 } }],
+];
+
+for (const [label, overrides] of BAD_VALUES) {
+  test(`loadConfig rejects an invalid ${label}: ${JSON.stringify(overrides)}`, () => withCfgDir((dir) => {
+    assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides }), (e) => e.message.startsWith('config:') && e.message.includes(label));
+  }));
+}
+
+test('a route model id must be usable as a choice key', () => withCfgDir((dir) => {
+  const model = (id) => ({ id, tier: 1, contextWindow: 1000, efforts: ['low'] });
+  for (const id of [' a', 'a ', 'a\nb', 'a\tb', 'x'.repeat(129), 'a\u0000b']) {
+    assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { route: { models: [model(id)] } } }), /route\.models: id/, JSON.stringify(id));
+  }
+  const ok = loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { route: { models: [model('vendor/model 1.5'), model('x'.repeat(128))] } } });
+  assert.equal(ok.route.models[0].id, 'vendor/model 1.5');
+}));
+
+test('server.maxBodyBytes defaults to 8 MB', () => withCfgDir((dir) => {
+  assert.equal(loadConfig({ env: cfgEnv(dir), cwd: dir }).server.maxBodyBytes, 8 * 1024 * 1024);
+}));
+
+test('tokenize gives a stop word no term at all, not even its singular', () => {
+  assert.deepEqual(tokenize('does'), []);
+  assert.deepEqual(tokenize('this as is'), []);
+  assert.deepEqual(tokenize('how does answers work'), ['answers', 'answer', 'work']);
+});
+
+test('loadConfig reports a section of the wrong type, naming the section and the file', () => withCfgDir((dir) => {
+  const fromFile = (body) => {
+    const file = path.join(dir, 'c.json');
+    fs.writeFileSync(file, JSON.stringify(body));
+    return () => loadConfig({ env: cfgEnv(dir), cwd: dir, file });
+  };
+  assert.throws(fromFile({ memory: null }), (e) => e instanceof Error && !(e instanceof TypeError) && /"memory" must be an object/.test(e.message) && e.message.includes('c.json'));
+  assert.throws(fromFile({ route: 5 }), (e) => /"route" must be an object/.test(e.message) && e.message.includes('c.json'));
+  assert.throws(fromFile({ ledger: [] }), /"ledger" must be an object/);
+  assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { memory: null } }), /"memory" must be an object in overrides/);
+  assert.throws(() => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { server: 'x' } }), /"server" must be an object/);
+  loadConfig({ env: cfgEnv(dir), cwd: dir, overrides: { memory: undefined } });
+}));
+
+test('retrieve.respectGitignore and ledger.maxBytes have defaults and are validated', () => withCfgDir((dir) => {
+  const load = (overrides) => () => loadConfig({ env: cfgEnv(dir), cwd: dir, overrides });
+  const c = load({})();
+  assert.equal(c.retrieve.respectGitignore, true);
+  assert.equal(c.ledger.maxBytes, 10 * 1024 * 1024);
+  assert.equal(load({ retrieve: { respectGitignore: false } })().retrieve.respectGitignore, false);
+  assert.equal(load({ ledger: { maxBytes: 4096 } })().ledger.maxBytes, 4096);
+  assert.throws(load({ retrieve: { respectGitignore: 'yes' } }), /retrieve\.respectGitignore must be true or false/);
+  for (const bad of [0, -1, 1.5, '10', null, Infinity]) assert.throws(load({ ledger: { maxBytes: bad } }), /ledger\.maxBytes must be a positive integer/);
+}));

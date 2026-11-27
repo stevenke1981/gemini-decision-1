@@ -6,3 +6,5 @@ node_modules/
 *.jsonl
 .sites-runtime/
 gemini-core.config.user.json
+*.rejected
+*.lock

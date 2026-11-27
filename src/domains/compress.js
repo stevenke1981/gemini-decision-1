@@ -27,6 +27,7 @@ const DECIMALS = 2;
 const UNDER_SOFT = 'under the soft limit';
 const NOTHING_ELIGIBLE = 'nothing eligible';
 const ESCALATED = 'rules escalated to reach the target ratio';
+const USER_GUARDED = 'rules protected user instructions: no user segment dropped, the first user segment kept';
 
 const COMPACT_QUESTION = Object.freeze({
   type: 'predicate',
@@ -116,6 +117,15 @@ function oldestFirst(segments) {
   return [...segments].sort((a, b) => a.turn - b.turn);
 }
 
+/**
+ * The id of the first user segment of the transcript (lowest turn, ties by input order), or null
+ * when there is none. It usually holds the task statement, so the rules never change it from keep.
+ */
+function protectedId(segments) {
+  const first = segments.reduce((best, s) => (s.role === 'user' && (!best || s.turn < best.turn) ? s : best), null);
+  return first ? first.id : null;
+}
+
 function ratioOf(input) {
   return totalTokens(input.segments) / input.window;
 }
@@ -135,9 +145,21 @@ function ruleAction(seg, age) {
 }
 
 /**
+ * The escalation passes, in order: each turns `from` into `to` for the eligible segments of `role`,
+ * oldest first. User segments come last, so user instructions are cut only as a last resort.
+ */
+const ESCALATION_PASSES = Object.freeze([
+  Object.freeze({ role: 'tool', from: KEEP, to: SUMMARIZE }),
+  Object.freeze({ role: 'assistant', from: KEEP, to: SUMMARIZE }),
+  Object.freeze({ role: 'tool', from: SUMMARIZE, to: DROP }),
+  Object.freeze({ role: 'user', from: KEEP, to: SUMMARIZE }),
+]);
+
+/**
  * Escalates `actions` until the projected usage is at or below targetRatio × window, or nothing
- * else helps. Pass 1 turns keep into summarize, oldest eligible first; pass 2 turns the summarized
- * tool segments into drop, oldest first.
+ * else helps. The passes (ESCALATION_PASSES) run in order, each oldest eligible first and only while
+ * still above the target: tool keep to summarize, assistant keep to summarize, tool summarize to
+ * drop, and last user keep to summarize. The first user segment (protectedId) is never touched.
  * @returns {{actions:Record<string,string>, changed:boolean}}
  */
 export function escalate(actions, input, cfg) {
@@ -145,7 +167,9 @@ export function escalate(actions, input, cfg) {
   const summaries = summariesFor(input.segments, cfg.compress.summaryChars);
   const decided = new Map(Object.entries(actions));
   const actionFor = (seg) => decided.get(seg.id) ?? KEEP;
-  const eligible = oldestFirst(eligibleSegments(input.segments, cfg.compress.keepRecentTurns));
+  const guarded = protectedId(input.segments);
+  const eligible = oldestFirst(eligibleSegments(input.segments, cfg.compress.keepRecentTurns))
+    .filter((s) => s.id !== guarded);
   let total = input.segments.reduce((sum, s) => sum + sizeAfter(s, actionFor(s), summaries), 0);
   let changed = false;
   const move = (seg, to) => {
@@ -155,13 +179,29 @@ export function escalate(actions, input, cfg) {
     total += delta;
     changed = true;
   };
-  for (const seg of eligible) {
-    if (total > limit && actionFor(seg) === KEEP) move(seg, SUMMARIZE);
-  }
-  for (const seg of eligible) {
-    if (total > limit && seg.role === 'tool' && actionFor(seg) === SUMMARIZE) move(seg, DROP);
+  for (const pass of ESCALATION_PASSES) {
+    for (const seg of eligible) {
+      if (total > limit && seg.role === pass.role && actionFor(seg) === pass.from) move(seg, pass.to);
+    }
   }
   return { actions: Object.fromEntries(decided), changed };
+}
+
+/**
+ * Gemini's actions with the user-instruction limits applied: a drop on a user segment becomes
+ * summarize, and any non-keep on the protected first user segment becomes keep.
+ * @returns {{actions:Record<string,string>, changed:boolean}}
+ */
+function guardUserSegments(actions, input) {
+  const guarded = protectedId(input.segments);
+  const users = new Set(input.segments.filter((s) => s.role === 'user').map((s) => s.id));
+  let changed = false;
+  const limited = Object.entries(actions).map(([id, action]) => {
+    const allowed = id === guarded ? KEEP : users.has(id) && action === DROP ? SUMMARIZE : action;
+    if (allowed !== action) changed = true;
+    return [id, allowed];
+  });
+  return { actions: Object.fromEntries(limited), changed };
 }
 
 // ---- result shape --------------------------------------------------------------------------
@@ -172,18 +212,24 @@ export function escalate(actions, input, cfg) {
  */
 function resultFrom(input, cfg, compact, decisions) {
   const tokensBefore = totalTokens(input.segments);
-  if (!compact) return shapeResult(input, false, {}, tokensBefore, tokensBefore);
+  if (!compact) return shapeResult(input, cfg, false, {}, tokensBefore, tokensBefore);
   const summaries = summariesFor(input.segments, cfg.compress.summaryChars);
   const realized = new Map(input.segments.map((s) => {
     const action = actionOf(decisions, s.id);
     return [s.id, action === SUMMARIZE && !summaries.get(s.id) ? KEEP : action];
   }));
   const tokensAfter = input.segments.reduce((sum, s) => sum + sizeAfter(s, realized.get(s.id), summaries), 0);
-  return shapeResult(input, true, Object.fromEntries(realized), tokensBefore, tokensAfter);
+  return shapeResult(input, cfg, true, Object.fromEntries(realized), tokensBefore, tokensAfter);
 }
 
-function shapeResult(input, compact, actions, tokensBefore, tokensAfter) {
-  return { compact, actions, segments: null, tokensBefore, tokensAfter, ratioAfter: tokensAfter / input.window };
+function shapeResult(input, cfg, compact, actions, tokensBefore, tokensAfter) {
+  return { compact, actions, segments: null, tokensBefore, ...usageAfter(input, cfg, tokensAfter) };
+}
+
+/** tokensAfter, ratioAfter and targetMet (ratioAfter at or below targetRatio) for a token count. */
+function usageAfter(input, cfg, tokensAfter) {
+  const ratioAfter = tokensAfter / input.window;
+  return { tokensAfter, ratioAfter, targetMet: ratioAfter <= cfg.compress.targetRatio };
 }
 
 // ---- plan, interpret -----------------------------------------------------------------------
@@ -195,7 +241,6 @@ function stateSegment(seg, id, current, excerptChars) {
     age: current - seg.turn,
     tokens: seg.tokens,
     text: excerpt(redact(seg.text), excerptChars, true),
-    keepTail: true,
   };
 }
 
@@ -265,7 +310,8 @@ function compactReasons(input, ratio, hardRatio, pCompact) {
 
 /**
  * Rules only. Compacts when forced or at or above the soft limit and something is eligible; the
- * rule actions are escalated toward targetRatio.
+ * rule actions are escalated toward targetRatio. User segments are summarized only as a last
+ * resort, never dropped, and the first user segment is always kept.
  */
 export function heuristic(input, cfg) {
   if (isUnderSoft(input, cfg)) return verdict(resultFrom(input, cfg, false, {}), null, [UNDER_SOFT]);
@@ -280,23 +326,21 @@ export function heuristic(input, cfg) {
 }
 
 /**
- * Runs after Gemini: when Gemini compacts, escalates its actions toward targetRatio. The verdict is
- * source 'gemini+rules' only when the escalation changed an action; otherwise Gemini's verdict is
- * returned as it is. The rules argument is not needed: the escalation is rule-based on its own.
+ * Runs after Gemini: when Gemini compacts, first limits its actions on user segments (no user
+ * segment is dropped, the first user segment is kept), then escalates toward targetRatio. The
+ * verdict is source 'gemini+rules' only when either step changed an action; otherwise Gemini's
+ * verdict is returned as it is. The rules argument is not needed: both steps are rules on their own.
  */
 export function gate(gemini, rules, input, cfg) {
   if (!gemini.result.compact) return gemini;
-  const escalated = escalate(gemini.result.actions, input, cfg);
-  if (!escalated.changed) return gemini;
-  return verdict(
-    resultFrom(input, cfg, true, escalated.actions),
-    gemini.confidence,
-    [...gemini.reasons, ESCALATED],
-    'gemini+rules',
-  );
+  const guarded = guardUserSegments(gemini.result.actions, input);
+  const escalated = escalate(guarded.actions, input, cfg);
+  if (!guarded.changed && !escalated.changed) return gemini;
+  const reasons = [...gemini.reasons, ...(guarded.changed ? [USER_GUARDED] : []), ...(escalated.changed ? [ESCALATED] : [])];
+  return verdict(resultFrom(input, cfg, true, escalated.actions), gemini.confidence, reasons, 'gemini+rules');
 }
 
-/** Applies the actions when compacting and sets segments, tokensBefore, tokensAfter, ratioAfter. */
+/** Applies the actions when compacting and sets segments, tokensBefore, tokensAfter, ratioAfter, targetMet. */
 export function finalize(v, input, cfg) {
   const { result } = v;
   const tokensBefore = totalTokens(input.segments);
@@ -308,8 +352,7 @@ export function finalize(v, input, cfg) {
       ...result,
       segments: applied ? applied.segments : null,
       tokensBefore,
-      tokensAfter,
-      ratioAfter: tokensAfter / input.window,
+      ...usageAfter(input, cfg, tokensAfter),
     },
   };
 }

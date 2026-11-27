@@ -48,6 +48,8 @@ skills --task TEXT --dir DIRECTORY recommend skills
 retrieve --query TEXT --root DIR   select relevant repository chunks
 recall --query TEXT                select stored memories
 remember --text TEXT --dry-run     evaluate a memory without writing
+memories                           list every stored memory
+forget --id ID                     remove one stored memory
 compress --file INPUT.json         choose which transcript segments to keep, summarize or drop
 serve                              start the local HTTP sidecar
 mcp                                start the stdio MCP server
@@ -73,13 +75,18 @@ GEMINI_CORE_MODE = "heuristic"
 
 Use the package or home .env.local, or the host's secret mechanism, for a key. Adding this configuration is a user action; this repository does not install itself into a host. See [integration examples](docs/integration.md) and the [Traditional Chinese guide](docs/usage.zh-TW.md).
 
-For HTTP use node bin/gemini-core.js serve --mode heuristic, then GET /health, GET /v1/stats, or POST /v1/decide/:kind with a JSON body. The default address is 127.0.0.1:8792. The server has **no authentication**; keep it on loopback and do not expose it to untrusted clients. Requests with an Origin header are rejected.
+For HTTP use node bin/gemini-core.js serve --mode heuristic, then GET /health, GET /v1/stats, or POST /v1/decide/:kind with a JSON body. The default address is 127.0.0.1:8792. The server has **no authentication**; keep it on loopback and do not expose it to untrusted clients. Requests with an Origin header are rejected, and so are requests whose Host header is not a loopback host while the server is bound to loopback. The request body limit is `server.maxBodyBytes` (default 8 MB).
+
+The repository index honours `.gitignore` files inside the indexed root (`retrieve.respectGitignore`, default true), so files git ignores are neither indexed nor sent to Gemini. It reads only `.gitignore` files, not `.git/info/exclude` or global excludes, and never runs `git`. Matching ignores ASCII letter case on Windows and macOS, as git does by default. A `.gitignore` that cannot be used (a link, unreadable, too large) is counted in the result's `skipped`. Long-running servers build the index without blocking other requests.
+
+Replaced and removed memories are appended to `memory.jsonl.history`. The decision ledger rotates to `decisions.jsonl.1` once it passes `ledger.maxBytes` (default 10 MB).
+
+Request input is trusted less than configuration: a skills `dirs` entry sent over MCP or HTTP must lie inside the configured `skills.dirs` or the working folder. In rules mode only observations with `source: "user"` are stored as memories; with Gemini, a tool's or the agent's observation may be kept as a new memory but never rewrites one the user wrote. Configuration is strict: an unknown key is an error.
 
 ## Node.js library
 
 ~~~js
-import { loadConfig } from './src/config.js';
-import { createEngine } from './src/engine.js';
+import { loadConfig, createEngine } from './src/lib.js';
 
 const config = loadConfig({ overrides: { mode: 'heuristic' } });
 const engine = createEngine({ config });

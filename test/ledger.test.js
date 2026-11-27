@@ -102,3 +102,106 @@ test('a failed decision is written with a null source and null summary', () => w
   assert.equal(line.summary, null);
   assert.equal(line.calls, 0);
 }));
+
+const POSIX_ONLY = { skip: process.platform === 'win32' && 'file modes are not enforced on Windows' };
+
+/** The size in bytes of one ledger line for DECISION. */
+function lineBytes() {
+  return Buffer.byteLength(`${JSON.stringify(ledgerRecord(DECISION))}\n`, 'utf8');
+}
+
+test('the ledger file is created private (0o600)', POSIX_ONLY, () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  createLedger({ path: file }).append(DECISION);
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+}));
+
+test('without maxBytes the ledger never rotates', () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  const ledger = createLedger({ path: file, maxBytes: undefined });
+  for (let i = 0; i < 20; i += 1) ledger.append(DECISION);
+  assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 20);
+  assert.equal(fs.existsSync(`${file}.1`), false);
+}));
+
+test('with maxBytes a full ledger moves to <file>.1, replacing the old one, and a new file starts', () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  const ledger = createLedger({ path: file, maxBytes: lineBytes() * 2 + 10 });
+  for (const kind of ['a', 'b', 'c', 'd', 'e']) ledger.append({ ...DECISION, kind });
+  const kindsIn = (f) => fs.readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l).kind);
+  assert.deepEqual(kindsIn(file), ['e']);
+  assert.deepEqual(kindsIn(`${file}.1`), ['c', 'd']);
+}));
+
+test('a single line larger than maxBytes is still written, to a fresh file', () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  const ledger = createLedger({ path: file, maxBytes: 1 });
+  ledger.append(DECISION);
+  assert.equal(fs.existsSync(file), true);
+  assert.equal(fs.existsSync(`${file}.1`), false);
+  ledger.append(DECISION);
+  assert.equal(fs.existsSync(`${file}.1`), true);
+  assert.equal(fs.readFileSync(file, 'utf8').trim().split('\n').length, 1);
+}));
+
+test('a rotation failure is reported once and never throws', () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  fs.writeFileSync(file, `${'x'.repeat(100)}\n`);
+  fs.mkdirSync(`${file}.1`); // a non-empty folder cannot be replaced by the rename
+  fs.writeFileSync(path.join(`${file}.1`, 'keep'), 'x');
+  const ledger = createLedger({ path: file, maxBytes: 50 });
+  const original = process.stderr.write;
+  const captured = [];
+  process.stderr.write = (chunk) => {
+    captured.push(String(chunk));
+    return true;
+  };
+  try {
+    assert.doesNotThrow(() => ledger.append(DECISION));
+    assert.doesNotThrow(() => ledger.append(DECISION));
+  } finally {
+    process.stderr.write = original;
+  }
+  assert.equal(captured.length, 1);
+  assert.match(captured[0], /decision ledger not written/);
+  // the records are still appended after the failed rotation, and nothing is left aside
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean);
+  assert.equal(lines.length, 1 + 2);
+  assert.equal(lines[0], 'x'.repeat(100));
+  assert.equal(JSON.parse(lines[2]).kind, 'route');
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.rotating')), []);
+}));
+
+test('a rotator that measured a stale size does not clobber <file>.1 with a fresh file', () => withDir((dir) => {
+  const file = path.join(dir, 'decisions.jsonl');
+  const max = lineBytes() * 3 + 10;
+  const a = createLedger({ path: file, maxBytes: max });
+  const b = createLedger({ path: file, maxBytes: max });
+  for (const kind of ['o1', 'o2', 'o3']) a.append({ ...DECISION, kind });
+  const kindsIn = (f) => fs.readFileSync(f, 'utf8').trim().split('\n').map((l) => JSON.parse(l).kind);
+  // B measures the full file; before it renames, A rotates it and appends to the fresh one.
+  const realStat = fs.statSync;
+  let fired = false;
+  fs.statSync = (...args) => {
+    const st = realStat(...args);
+    if (!fired && args[0] === file) {
+      fired = true;
+      a.append({ ...DECISION, kind: 'A' });
+    }
+    return st;
+  };
+  try {
+    b.append({ ...DECISION, kind: 'B' });
+  } finally {
+    fs.statSync = realStat;
+  }
+  assert.deepEqual(kindsIn(`${file}.1`), ['o1', 'o2', 'o3']);
+  assert.deepEqual(kindsIn(file), ['A', 'B']);
+  assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.rotating')), []);
+}));
+
+test('maxBytes must be a positive integer when given', () => {
+  for (const bad of [0, -1, 1.5, '10', null, NaN]) {
+    assert.throws(() => createLedger({ path: 'x.jsonl', maxBytes: bad }), TypeError, String(bad));
+  }
+});

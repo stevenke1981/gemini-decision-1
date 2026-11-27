@@ -4,7 +4,7 @@
 // reasons or the store. Gemini's answers are read through src/gemini/answers.js; the rules decide
 // when Gemini is unavailable, and in heuristic mode.
 import { MEMORY_TYPES } from '../defaults.js';
-import { SECRET, certainty, indexId, mean, verdict } from '../contract.js';
+import { SECRET, certainty, indexId, mean, redact, verdict } from '../contract.js';
 import { excerpt, similarity } from '../text.js';
 import { choiceAnswer, predicateProbability } from '../gemini/answers.js';
 
@@ -78,7 +78,7 @@ function requireStore(deps, kind) {
 
 /** A memory as a result reports it: full text, with its probability (null when rules decided). */
 function memoryOut(record, probability) {
-  return { id: record.id, type: record.type, text: record.text, probability };
+  return { id: record.id, type: record.type, text: record.text, source: record.source, probability };
 }
 
 /** Records paired with their question names m0, m1, ... */
@@ -88,7 +88,7 @@ function asked(records) {
 
 /** A memory as the Gemini state carries it: the question name as id, the text excerpted. */
 function stateMemory({ name, record }) {
-  return { id: name, type: record.type, text: excerpt(record.text, MEMORY_CHARS) };
+  return { id: name, type: record.type, text: excerpt(redact(record.text), MEMORY_CHARS) };
 }
 
 function noMatch() {
@@ -124,7 +124,7 @@ function planRecall(input) {
   if (input.memories.length === 0) return { settled: noMatch() };
   const asks = asked(input.memories);
   return {
-    state: { query: excerpt(input.query, QUERY_CHARS), memories: asks.map(stateMemory) },
+    state: { query: excerpt(redact(input.query), QUERY_CHARS), memories: asks.map(stateMemory) },
     questions: asks.map(({ name }) => ({
       type: 'predicate',
       name,
@@ -263,7 +263,7 @@ function targetQuestion(asks) {
     type: 'choice',
     name: 'target',
     instructions: 'Which similar memory does the observation update?',
-    choices: asks.map(({ name, record }) => ({ value: name, description: excerpt(record.text, TARGET_CHARS) })),
+    choices: asks.map(({ name, record }) => ({ value: name, description: excerpt(redact(record.text), TARGET_CHARS) })),
   };
 }
 
@@ -282,7 +282,7 @@ function planWrite(input) {
   const asks = asked(input.similar);
   return {
     state: {
-      observation: excerpt(input.observation, OBSERVATION_CHARS),
+      observation: excerpt(redact(input.observation), OBSERVATION_CHARS),
       source: input.source,
       similar: asks.map(stateMemory),
     },
@@ -315,12 +315,21 @@ function interpretWrite(answers, ctx, cfg) {
 }
 
 /**
- * Rules: a secret or an already stored text is skipped; a similar memory (Jaccard at least
- * duplicateSimilarity) is updated; remember-style wording is saved as new; anything else skipped.
+ * Rules: a secret or an already stored text is skipped; so is any observation whose source is not
+ * the user (text from a tool or the agent must not become a standing instruction); a similar
+ * memory (Jaccard at least duplicateSimilarity) is updated; remember-style wording is saved as
+ * new; anything else skipped.
  */
 function heuristicWrite(input, cfg) {
   const settled = settleWrite(input);
   if (settled) return settled;
+  if (input.source !== 'user') {
+    return verdict(
+      writeResult('skip', typeOf(input), null, input.observation),
+      null,
+      [`source is ${input.source}, not user: the rules only keep what the user said`],
+    );
+  }
   const best = bestMatch(input);
   const type = typeOf(input);
   if (best && best.similarity >= cfg.memory.duplicateSimilarity) {
@@ -334,6 +343,24 @@ function heuristicWrite(input, cfg) {
     return verdict(writeResult('save_new', type, null, input.observation), null, ['remember-style wording']);
   }
   return verdict(writeResult('skip', type, null, input.observation), null, ['no remember-style wording and no similar memory']);
+}
+
+/**
+ * Gemini may keep a tool's or the agent's observation as a new memory, but only the user rewrites
+ * a memory the user wrote: such an update is skipped, since it would replace the user's text and
+ * keep the user as its source.
+ */
+function gateWrite(gemini, rules, input) {
+  const r = gemini.result;
+  if (input.source === 'user' || r.action !== 'update') return gemini;
+  const target = input.similar.find((record) => record.id === r.targetId);
+  if (target?.source !== 'user') return gemini;
+  return verdict(
+    writeResult('skip', r.type, null, input.observation),
+    gemini.confidence,
+    [...gemini.reasons, `source is ${input.source}: only the user rewrites a memory the user wrote`],
+    'gemini+rules',
+  );
 }
 
 /** Applies the decision unless it is a dry run or a skip. Store errors propagate. */
@@ -359,6 +386,7 @@ export const memoryWrite = Object.freeze({
   plan: planWrite,
   interpret: interpretWrite,
   heuristic: heuristicWrite,
+  gate: gateWrite,
   finalize: finalizeWrite,
   summarize: summarizeWrite,
 });

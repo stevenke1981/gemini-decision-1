@@ -9,7 +9,7 @@ import { askGemini } from '../src/gemini/client.js';
 import { answersByName } from '../src/gemini/answers.js';
 import { fakeGemini, predicate } from './helpers/fakeGemini.js';
 
-const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-skills-'));
+const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-skills-'));
 after(() => fs.rmSync(HOME, { recursive: true, force: true }));
 
 function cfgWith(overrides) {
@@ -79,9 +79,10 @@ test('prepare loads the catalog only when the input carries none', async () => {
   const a = await skills.prepare(norm({ task: 'x' }, withDirs), withDirs, deps);
   assert.deepEqual(calls, [['/from/config']]);
   assert.equal(a.catalog.length, 4);
-  const own = norm({ task: 'x', dirs: ['/own'] }, withDirs);
+  const ownDir = path.join(HOME, 'own');
+  const own = norm({ task: 'x', dirs: [ownDir] }, withDirs);
   await skills.prepare(own, withDirs, deps);
-  assert.deepEqual(calls[1], ['/own']);
+  assert.deepEqual(calls[1], [ownDir]);
   const given = norm({ task: 'x', catalog: [] });
   const c = await skills.prepare(given, withDirs, deps);
   assert.equal(calls.length, 2, 'no loadCatalog call when a catalog is given');
@@ -311,4 +312,73 @@ test('the whole decision runs through askGemini and fakeGemini, and the state ca
   const v = skills.interpret(answersByName(body), planned.ctx, cfg);
   assert.deepEqual(names(v.result), [planned.ctx.shortlist[0].name, planned.ctx.shortlist[2].name]);
   assert.equal(v.result.considered, 4);
+});
+
+// ------------------------------------------------ dirs allow-list
+
+const cfgIn = (dirs) => loadConfig({ env: { GEMINI_CORE_HOME: HOME }, cwd: HOME, overrides: { skills: { dirs } } });
+const outsideError = (re = /outside skills\.dirs and the working folder/) => (e) => e instanceof TypeError && re.test(e.message);
+
+test('normalize accepts a dir below the working folder, resolves relative dirs, and a dir listed in skills.dirs', () => {
+  const sub = path.join(HOME, 'team', 'skills');
+  assert.deepEqual(norm({ task: 'x', dirs: [sub, 'rel/skills', HOME] }).dirs, [sub, path.join(HOME, 'rel', 'skills'), HOME]);
+  const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-skills-else-'));
+  try {
+    const listed = cfgIn([elsewhere]);
+    assert.deepEqual(norm({ task: 'x', dirs: [elsewhere, path.join(elsewhere, 'sub')] }, listed).dirs, [elsewhere, path.join(elsewhere, 'sub')]);
+    assert.throws(() => norm({ task: 'x', dirs: [elsewhere] }), outsideError());
+  } finally {
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  }
+});
+
+test('normalize rejects a dir outside skills.dirs and the working folder, naming the resolved path', () => {
+  const outside = path.resolve(HOME, '..', 'elsewhere');
+  assert.throws(() => norm({ task: 'x', dirs: [outside] }), (e) => outsideError()(e) && e.message.includes(outside));
+  assert.throws(() => norm({ task: 'x', dirs: ['../escape'] }), outsideError());
+  assert.throws(() => norm({ task: 'x', dirs: [`${HOME}-sibling`] }), outsideError());
+  assert.throws(() => norm({ task: 'x', dirs: [path.parse(HOME).root] }), outsideError());
+  if (process.platform === 'win32') assert.throws(() => norm({ task: 'x', dirs: ['\\\\host.invalid\\share'] }), outsideError());
+});
+
+test('prepare refuses a request dir that is a junction leading outside, and never calls the loader', async () => {
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-skills-out-'));
+  const link = path.join(HOME, 'linked-skills');
+  try {
+    fs.symlinkSync(outside, link, 'junction');
+    let loads = 0;
+    const deps = { loadCatalog: () => { loads++; return CATALOG; } };
+    const input = norm({ task: 'x', dirs: [link] });
+    await assert.rejects(skills.prepare(input, cfg, deps), outsideError(/resolves to .* outside skills\.dirs/));
+    assert.equal(loads, 0);
+    const listed = cfgIn([outside]);
+    await skills.prepare(norm({ task: 'x', dirs: [link] }, listed), listed, deps);
+    assert.equal(loads, 1, 'a link to a folder that skills.dirs lists is fine');
+  } finally {
+    fs.rmSync(link, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('prepare trusts the dirs of the config and does not check them', async () => {
+  const calls = [];
+  const trusted = cfgIn(['/not/under/cwd']);
+  await skills.prepare(norm({ task: 'x' }, trusted), trusted, { loadCatalog: (dirs) => { calls.push(dirs); return []; } });
+  assert.deepEqual(calls, [['/not/under/cwd']]);
+});
+
+// A secret whose first half would survive the cut if the text were cut before it is redacted.
+const KEY = 'sk-abcdefghijklmnopqrstuvwxyz0123456789';
+// The key starts 12 characters before the cut: 11 of its characters survive a cut, too few to match.
+const straddling = (max) => `${'a '.repeat((max - 12) / 2)}${KEY} tail`;
+
+test('plan redacts the task and the skill descriptions before cutting them', () => {
+  const task = `word ${straddling(2000).slice(5)}`;
+  const description = straddling(300);
+  const catalog = [{ name: 'word-skill', description }];
+  const { state } = skills.plan(norm({ task, catalog }), cfg);
+  for (const text of [state.task, state.skills[0].description]) {
+    assert.ok(!text.includes('sk-'), text.slice(-40));
+    assert.ok(text.includes('[redacted]'), text.slice(-40));
+  }
 });

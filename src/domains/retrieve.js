@@ -3,10 +3,10 @@
 // one relevance predicate per candidate; the rules rank the candidates by their BM25 score.
 // Candidates come from the caller or from the repository index (prepare). The text sent to Gemini
 // is cut to excerptChars, and each span that looks like a secret is replaced by [redacted].
-import fs from 'node:fs';
 import path from 'node:path';
 import { GREETING, redact, certainty, indexId, mean, requireText, verdict } from '../contract.js';
 import { predicateProbability } from '../gemini/answers.js';
+import { isWithin, realWithinAny } from '../paths.js';
 import { estimateTokens, excerpt, tokenize } from '../text.js';
 
 /** Lexical rule: a chunk is kept when its score is at least this share of the best score. */
@@ -64,17 +64,6 @@ function positiveIntOr(v, fallback, field) {
   return v;
 }
 
-// Windows file names ignore case, so the root check compares folded paths there.
-const FOLD_CASE = process.platform === 'win32';
-const folded = (p) => (FOLD_CASE ? p.toLowerCase() : p);
-
-/** True when `target` is `base` itself or lies below it; both are absolute paths. */
-function isWithin(base, target) {
-  const rel = path.relative(folded(base), folded(target));
-  if (rel === '') return true;
-  return rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel);
-}
-
 /**
  * The root as an absolute path. It must lie in one of retrieve.allowedRoots, or, when that list
  * is empty, in the working folder of the process. Chunk text from it may be sent to Gemini.
@@ -119,37 +108,34 @@ function shortlistOf(candidates, n) {
 
 /** A root that is a link (symlink, junction) must still resolve inside the allowed folders. */
 function assertRealRootAllowed(root, cfg) {
-  const real = realOrSelf(root);
-  if (!allowedBases(cfg).some((base) => isWithin(realOrSelf(path.resolve(base)), real))) {
-    throw new TypeError(`retrieve: root ${root} resolves to ${real}, outside the allowed folders`);
-  }
+  const { ok, real } = realWithinAny(allowedBases(cfg), root);
+  if (!ok) throw new TypeError(`retrieve: root ${root} resolves to ${real}, outside the allowed folders`);
 }
 
-function realOrSelf(p) {
-  try {
-    return fs.realpathSync.native(p);
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-    // Resolve the existing ancestor as well: a missing child still carries its parent's
-    // junction or Windows 8.3 alias, while an existing allowed base is already canonical.
-    const parent = path.dirname(p);
-    return parent === p ? p : path.join(realOrSelf(parent), path.basename(p));
-  }
+/** What the index says about its own completeness; missing values count as complete. */
+function completenessOf(index) {
+  const skipped = Number.isInteger(index.skipped) && index.skipped > 0 ? index.skipped : 0;
+  return { truncated: index.truncated === true, skipped };
 }
 
-/** The candidates from the repository index, when none were given and a root is. */
+const COMPLETE = Object.freeze({ truncated: false, skipped: 0 });
+
+/** The candidates from the repository index, with its completeness, when none were given and a root is. */
 async function searchRepo(input, cfg, deps) {
   if (typeof deps?.repoIndex !== 'function') throw new Error('retrieve: root given but no repoIndex dependency');
   assertRealRootAllowed(input.root, cfg);
   const index = await deps.repoIndex(input.root);
-  return index.search(input.query, cfg.retrieve.shortlist);
+  return { candidates: index.search(input.query, cfg.retrieve.shortlist), ...completenessOf(index) };
 }
 
-/** Fills `candidates` from the repository index when absent and a root is given. */
+/**
+ * Fills `candidates` from the repository index when absent and a root is given, and records
+ * whether that index was truncated and how many entries it skipped (false and 0 otherwise).
+ */
 async function prepare(input, cfg, deps) {
-  if (input.candidates !== undefined) return { ...input };
-  const candidates = input.root === undefined ? [] : await searchRepo(input, cfg, deps);
-  return { ...input, candidates };
+  if (input.candidates !== undefined) return { ...input, ...COMPLETE };
+  if (input.root === undefined) return { ...input, candidates: [], ...COMPLETE };
+  return { ...input, ...(await searchRepo(input, cfg, deps)) };
 }
 
 /** The text as Gemini may see it: each secret-looking span replaced, then cut to `max`. */
@@ -170,8 +156,16 @@ function stateChunk(c, i, cfg) {
   return { id: chunkName(i), source: locate(c), text: safeText(c.text, cfg.retrieve.excerptChars) };
 }
 
-function emptyResult() {
-  return { needed: false, chunks: [], tokens: 0, considered: 0 };
+/** The completeness fields of a result, from an input or ctx that may predate them. */
+const completeOf = (x) => ({ truncated: x?.truncated === true, skipped: x?.skipped ?? 0 });
+
+const TRUNCATED_REASON = 'index was truncated; results may be incomplete';
+
+/** The reasons of a verdict, plus the truncation warning when the index was cut short. */
+const withTruncation = (reasons, x) => (x?.truncated === true ? [...reasons, TRUNCATED_REASON] : reasons);
+
+function emptyResult(x) {
+  return { needed: false, chunks: [], tokens: 0, considered: 0, ...completeOf(x) };
 }
 
 /**
@@ -181,12 +175,12 @@ function emptyResult() {
 function plan(input, cfg) {
   // Each candidate costs one predicate: Gemini sees at most `shortlist` of them, best score first.
   const candidates = shortlistOf(input.candidates ?? [], cfg.retrieve.shortlist);
-  if (candidates.length === 0) return { settled: verdict(emptyResult(), null, ['no candidates']) };
+  if (candidates.length === 0) return { settled: verdict(emptyResult(input), null, withTruncation(['no candidates'], input)) };
   const need = input.force ? [] : [NEED_QUESTION];
   return {
     state: { query: safeText(input.query, QUERY_CHARS), chunks: candidates.map((c, i) => stateChunk(c, i, cfg)) },
     questions: [...need, ...candidates.map((_, i) => chunkQuestion(i))],
-    ctx: { candidates, force: input.force, budgetTokens: input.budgetTokens },
+    ctx: { candidates, force: input.force, budgetTokens: input.budgetTokens, ...completeOf(input) },
   };
 }
 
@@ -230,7 +224,7 @@ function pickByRules(candidates, budgetTokens) {
 }
 
 /** The shared result shape of interpret and heuristic. */
-function resultOf(needed, picks, considered) {
+function resultOf(needed, picks, considered, complete) {
   return {
     needed,
     chunks: picks.map(({ candidate: c, probability }) => ({
@@ -243,6 +237,7 @@ function resultOf(needed, picks, considered) {
     })),
     tokens: picks.reduce((sum, { candidate }) => sum + estimateTokens(candidate.text), 0),
     considered,
+    ...completeOf(complete),
   };
 }
 
@@ -257,13 +252,13 @@ function interpret(answers, ctx, cfg) {
   const probs = candidates.map((_, i) => predicateProbability(answers, chunkName(i)));
   if (ctx.force) {
     const picks = pickByGemini(candidates, probs, threshold, budgetTokens);
-    return verdict(resultOf(true, picks, candidates.length), mean(probs.map(certainty)), ['forced: retrieval on']);
+    return verdict(resultOf(true, picks, candidates.length, ctx), mean(probs.map(certainty)), withTruncation(['forced: retrieval on'], ctx));
   }
   const pNeed = predicateProbability(answers, NEED_QUESTION.name);
   const needed = pNeed >= NEED_THRESHOLD;
   const picks = needed ? pickByGemini(candidates, probs, threshold, budgetTokens) : [];
   const reason = needed ? 'gemini: retrieval needed' : 'gemini: no retrieval needed';
-  return verdict(resultOf(needed, picks, candidates.length), certainty(pNeed), [reason]);
+  return verdict(resultOf(needed, picks, candidates.length, ctx), certainty(pNeed), withTruncation([reason], ctx));
 }
 
 /** Terms of a query, counted once each. */
@@ -273,15 +268,16 @@ const distinctTerms = (query) => new Set(tokenize(query)).size;
 function heuristic(input) {
   const candidates = input.candidates ?? [];
   const needed = input.force || (!GREETING.test(input.query) && distinctTerms(input.query) >= MIN_QUERY_TERMS);
-  if (!needed) return verdict(resultOf(false, [], candidates.length), null, ['rules: no retrieval needed']);
+  if (!needed) return verdict(resultOf(false, [], candidates.length, input), null, withTruncation(['rules: no retrieval needed'], input));
   const picks = pickByRules(candidates, input.budgetTokens);
-  return verdict(resultOf(true, picks, candidates.length), null, [`rules: ${picks.length} chunk(s) by score`]);
+  return verdict(resultOf(true, picks, candidates.length, input), null, withTruncation([`rules: ${picks.length} chunk(s) by score`], input));
 }
 
 /** One line for the ledger and the CLI; no text from the query or the chunks. */
 function summarize(result) {
-  if (!result.needed) return `not needed; ${result.considered} considered`;
-  return `${result.chunks.length} of ${result.considered} chunks, ${result.tokens} tokens`;
+  const partial = result.truncated ? '; index truncated' : '';
+  if (!result.needed) return `not needed; ${result.considered} considered${partial}`;
+  return `${result.chunks.length} of ${result.considered} chunks, ${result.tokens} tokens${partial}`;
 }
 
 /** The `retrieve` kind module (see src/contract.js). */

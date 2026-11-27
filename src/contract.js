@@ -57,17 +57,20 @@ export const GREETING = /^\s*(hi|hello|hey|yo|thanks|thank you|ok|okay|你好|�
 // A secret-looking string: never stored in memory, never sent in a memory_write state. It covers
 // PEM keys, well-known token prefixes, JWTs, Bearer and Authorization credentials, URL
 // credentials (scheme://user:pass@host), and key/value pairs whose key names a secret
-// (DB_PASSWORD=..., "apiKey": "...", client_secret = "...", password: abc).
+// (DB_PASSWORD=..., "apiKey": "...", client_secret = "...", password: abc), except when the value is
+// a literal or type name such as true, null or string.
 // A key name starts at the beginning of a run of name characters, so each run is scanned once.
 const SECRET_KEY_NAME = String.raw`(?<![\w.-])[\w.-]*(?:password|passwd|pwd|secret(?:[_-]?key)?|token|api[_-]?key|access[_-]?key|private[_-]?key|client[_-]?secret|auth)`;
 const SECRET_VALUE = String.raw`(?:"[^"\r\n]{3,}"|'[^'\r\n]{3,}'|[^\s"'\r\n]{3,})`;
+// Words that cannot be a credential when they are the whole value (`auth: true`, `token: string`).
+const HARMLESS_VALUE = String.raw`(?!(?:true|false|null|undefined|none|nil|string|number|boolean|str|int|bool)(?![^\s"'\r\n]))`;
 const SECRET_PARTS = [
   String.raw`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)`,
   String.raw`\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|glpat-[\w-]{16,}|xox[abpr]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})`,
   String.raw`\beyJ[\w-]+\.eyJ[\w-]+\.[\w-]+`,
   String.raw`\bbearer\s+(?=[\w.~+/=-]*\d)[\w.~+/=-]{12,}`,
   String.raw`\bauthorization["']?\s*[:=]\s*["']?(?:bearer|basic|token)\s+[\w.~+/=-]{3,}`,
-  String.raw`${SECRET_KEY_NAME}["']?\s*[:=]\s*${SECRET_VALUE}`,
+  String.raw`${SECRET_KEY_NAME}["']?\s*[:=]\s*${HARMLESS_VALUE}${SECRET_VALUE}`,
   String.raw`\b[a-z][a-z0-9+.-]{0,20}:\/\/[^\s:/@]+:[^\s/@]{3,}@`,
   String.raw`密碼\s*[:：=]\s*\S+`,
 ];

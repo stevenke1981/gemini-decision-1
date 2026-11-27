@@ -36,7 +36,8 @@ export function tokenize(text) {
     }
     const lower = word.toLowerCase();
     const parts = word.split(/_|(?<=[a-z0-9])(?=[A-Z])/).map((p) => p.toLowerCase()).filter(Boolean);
-    if (!STOP.has(lower) && lower.length > 1) out.push(lower);
+    if (STOP.has(lower)) continue;
+    if (lower.length > 1) out.push(lower);
     const singular = singularOf(lower);
     if (singular) out.push(singular);
     if (parts.length > 1) for (const p of parts) if (!STOP.has(p) && p.length > 1) out.push(p);

@@ -15,8 +15,14 @@ import { homeDir } from './envfile.js';
 export const CONFIG_FILE = 'gemini-core.config.json';
 // Below this a summary is mostly its `[summarized N→M tokens]` marker.
 const MIN_SUMMARY_CHARS = 64;
-const TRUSTED_ONLY_KEYS = [['gemini', 'url'], ['memory', 'path'], ['ledger', 'path'], ['skills', 'dirs'], ['retrieve', 'allowedRoots'], ['server', 'host']];
+const TRUSTED_ONLY_KEYS = [['gemini', 'url'], ['memory', 'path'], ['ledger', 'path'], ['ledger', 'enabled'], ['skills', 'dirs'], ['retrieve', 'allowedRoots'], ['retrieve', 'respectGitignore'], ['server', 'host']];
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+// route.models entries and route.start are validated by their own rules, so their keys are listed here.
+const MODEL_KEYS = Object.freeze(['id', 'tier', 'contextWindow', 'capabilities', 'local', 'efforts', 'strengths']);
+const START_KEYS = Object.freeze(['model', 'effort']);
+// The longest model id: route ids are choice keys of the model question (see validateQuestions).
+const MAX_CHOICE_KEY_CHARS = 128;
+const MAX_CHOICE_KEY_BYTES = 512;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
 
 function isPlainObject(v) {
@@ -68,6 +74,46 @@ function unsafeKey(value) {
   return null;
 }
 
+/** "section.key" (or a top-level key) of the first key `json` sets that DEFAULTS does not have, or null. */
+function unknownKey(json) {
+  for (const [key, value] of Object.entries(json)) {
+    if (!Object.hasOwn(DEFAULTS, key)) return key;
+    if (!isPlainObject(DEFAULTS[key])) continue;
+    if (!isPlainObject(value)) continue;
+    const inner = Object.keys(value).find((k) => !Object.hasOwn(DEFAULTS[key], k));
+    if (inner !== undefined) return `${key}.${inner}`;
+  }
+  return null;
+}
+
+/** The first section (a key of DEFAULTS whose default is an object) that `json` sets to something else, or null. */
+function wrongTypeSection(json) {
+  const hit = Object.entries(json).find(([key, value]) => value !== undefined
+    && Object.hasOwn(DEFAULTS, key) && isPlainObject(DEFAULTS[key]) && !isPlainObject(value));
+  return hit ? hit[0] : null;
+}
+
+/** "route.models[i].key" or "route.start.key" of the first unknown key in the route's own lists, or null. */
+function unknownRouteKey(json) {
+  const route = json.route;
+  if (!isPlainObject(route)) return null;
+  if (isPlainObject(route.start)) {
+    const k = Object.keys(route.start).find((x) => !START_KEYS.includes(x));
+    if (k !== undefined) return `route.start.${k}`;
+  }
+  if (!Array.isArray(route.models)) return null;
+  for (const [i, m] of route.models.entries()) {
+    const k = isPlainObject(m) ? Object.keys(m).find((x) => !MODEL_KEYS.includes(x)) : undefined;
+    if (k !== undefined) return `route.models[${i}].${k}`;
+  }
+  return null;
+}
+
+/** The first unknown key anywhere in a config object, or null. */
+function firstUnknownKey(json) {
+  return unknownKey(json) ?? unknownRouteKey(json);
+}
+
 /** Parses and checks one config file's text; `trusted` is false for a working-folder file. */
 function parseConfigFile(file, text, trusted) {
   let json;
@@ -82,6 +128,10 @@ function parseConfigFile(file, text, trusted) {
   }
   const unsafe = unsafeKey(json);
   if (unsafe) throw new Error(`config ${file}: "${unsafe}" is not allowed as a config key`);
+  const unknown = firstUnknownKey(json);
+  if (unknown) throw new Error(`config ${file}: unknown key "${unknown}"`);
+  const wrongType = wrongTypeSection(json);
+  if (wrongType) throw new Error(`config ${file}: "${wrongType}" must be an object`);
   const restricted = trusted ? null : untrustedKey(json);
   if (restricted) {
     throw new Error(`config ${file}: "${restricted}" can be set only in the home config or an explicit config file (--config or GEMINI_CORE_CONFIG), not in a working-folder config`);
@@ -141,6 +191,14 @@ function isAllowedGeminiUrl(text) {
   return url.protocol === 'https:' || (url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname));
 }
 
+/** True when `id` can be a choice key of the model question: the rule of validateQuestions. */
+function isChoiceKey(id) {
+  return typeof id === 'string' && id.trim() !== '' && id === id.trim()
+    && id.length <= MAX_CHOICE_KEY_CHARS && Buffer.byteLength(id, 'utf8') <= MAX_CHOICE_KEY_BYTES
+    && !/[\x00-\x1f\x7f-\x9f\s]/u.test(id.replaceAll(' ', ''));
+}
+
+const nonEmptyString = (v) => typeof v === 'string' && v.trim() !== '';
 const prob = (v) => Number.isFinite(v) && v >= 0 && v <= 1;
 const posInt = (v) => Number.isInteger(v) && v > 0;
 
@@ -151,6 +209,7 @@ function checkModels(models) {
   for (const m of models) {
     check(isPlainObject(m), 'route.models entries must be objects');
     check(typeof m.id === 'string' && m.id && !ids.has(m.id), `route.models: missing or duplicate id "${m.id}"`);
+    check(isChoiceKey(m.id), `route.models: id "${m.id}" must have no surrounding whitespace, no control characters or line breaks, and at most ${MAX_CHOICE_KEY_CHARS} characters`);
     ids.add(m.id);
     check(posInt(m.tier), `route.models ${m.id}: tier must be a positive integer`);
     check(posInt(m.contextWindow), `route.models ${m.id}: contextWindow must be a positive integer`);
@@ -165,6 +224,7 @@ function checkModels(models) {
 export function validateConfig(c) {
   check(MODES.includes(c.mode), `mode must be ${MODES.join('|')}; got "${c.mode}"`);
   check(isAllowedGeminiUrl(c.gemini.url), 'gemini.url must be an https URL without credentials (http only for 127.0.0.1 or localhost)');
+  check(nonEmptyString(c.gemini.model), 'gemini.model must be a non-empty string');
   check(posInt(c.gemini.timeoutMs), 'gemini.timeoutMs must be a positive integer');
   check(posInt(c.gemini.maxQuestionsPerCall) && c.gemini.maxQuestionsPerCall <= 1000, 'gemini.maxQuestionsPerCall must be 1 to 1000');
   check(prob(c.minConfidence), 'minConfidence must be 0..1');
@@ -174,19 +234,30 @@ export function validateConfig(c) {
     if (i > 0) check(EFFORTS.indexOf(c.ladder[i]) > EFFORTS.indexOf(c.ladder[i - 1]), 'ladder must run from least to most effort without repeats');
   }
   check(prob(c.route.effortQuantile) && prob(c.route.modelQuantile), 'route quantiles must be 0..1');
+  check(Number.isFinite(c.route.contextHeadroom) && c.route.contextHeadroom >= 1, 'route.contextHeadroom must be a number of at least 1');
   checkModels(c.route.models);
   if (c.route.start !== null) {
     const start = c.route.start;
     check(isPlainObject(start) && c.route.models.some((m) => m.id === start.model) && EFFORTS.includes(start.effort),
       'route.start must name a configured model and a known effort');
   }
+  check(Array.isArray(c.skills.dirs) && c.skills.dirs.every(nonEmptyString), 'skills.dirs must be an array of non-empty strings');
   check(posInt(c.skills.shortlist) && posInt(c.skills.maxSkills) && prob(c.skills.threshold), 'skills: shortlist/maxSkills positive, threshold 0..1');
   check(posInt(c.retrieve.shortlist) && posInt(c.retrieve.budgetTokens) && prob(c.retrieve.threshold), 'retrieve: shortlist/budgetTokens positive, threshold 0..1');
   check(Array.isArray(c.retrieve.allowedRoots) && c.retrieve.allowedRoots.every((r) => typeof r === 'string' && path.isAbsolute(r)), 'retrieve.allowedRoots must list absolute paths');
+  check(posInt(c.retrieve.maxFileBytes) && posInt(c.retrieve.maxFiles) && posInt(c.retrieve.excerptChars), 'retrieve: maxFileBytes, maxFiles and excerptChars must be positive integers');
+  check(Array.isArray(c.retrieve.extensions) && c.retrieve.extensions.every((e) => typeof e === 'string' && e.startsWith('.')), 'retrieve.extensions must be an array of strings starting with "."');
+  check(Array.isArray(c.retrieve.ignoreDirs) && c.retrieve.ignoreDirs.every((d) => typeof d === 'string'), 'retrieve.ignoreDirs must be an array of strings');
   check(posInt(c.retrieve.maxWalkMs), 'retrieve.maxWalkMs must be a positive integer');
+  check(typeof c.retrieve.respectGitignore === 'boolean', 'retrieve.respectGitignore must be true or false');
   check(Number.isInteger(c.cacheTtlMs) && c.cacheTtlMs >= 0, 'cacheTtlMs must be a non-negative integer');
   check(posInt(c.retrieve.chunkLines) && c.retrieve.chunkOverlap >= 0 && c.retrieve.chunkOverlap < c.retrieve.chunkLines, 'retrieve: chunkOverlap must be below chunkLines');
   check(prob(c.memory.recallThreshold) && prob(c.memory.durableThreshold) && prob(c.memory.duplicateSimilarity), 'memory thresholds must be 0..1');
+  check(posInt(c.memory.shortlist) && posInt(c.memory.maxRecall), 'memory: shortlist and maxRecall must be positive integers');
+  check(typeof c.ledger.enabled === 'boolean', 'ledger.enabled must be true or false');
+  check(posInt(c.ledger.maxBytes), 'ledger.maxBytes must be a positive integer');
+  check(nonEmptyString(c.server.host), 'server.host must be a non-empty string');
+  check(posInt(c.server.maxBodyBytes), 'server.maxBodyBytes must be a positive integer');
   const k = c.compress;
   check(prob(k.softRatio) && prob(k.hardRatio) && prob(k.targetRatio) && k.targetRatio <= k.softRatio && k.softRatio <= k.hardRatio, 'compress: need targetRatio <= softRatio <= hardRatio, all 0..1');
   check(Number.isInteger(k.keepRecentTurns) && k.keepRecentTurns >= 0, 'compress.keepRecentTurns must be >= 0');
@@ -218,6 +289,10 @@ export function loadConfig({ env = process.env, cwd = process.cwd(), file, overr
   const explicit = Boolean(file || env.GEMINI_CORE_CONFIG);
   const { file: used, json } = readConfigFile(configFileCandidates({ env, cwd, file }), { explicit, cwdFile: path.join(cwd, CONFIG_FILE) });
   const home = homeDir(env);
+  const unknown = firstUnknownKey(overrides ?? {});
+  if (unknown) throw new Error(`config: unknown key "${unknown}" in overrides`);
+  const wrongType = wrongTypeSection(overrides ?? {});
+  if (wrongType) throw new Error(`config: "${wrongType}" must be an object in overrides`);
   const merged = deepMerge(deepMerge(deepMerge(DEFAULTS, json), envOverrides(env)), overrides ?? {});
   const c = completeConfig(merged, { home, used, env, cwd });
   Object.defineProperty(c, 'apiKey', { value: env.GEMINI_API_KEY || env.GOOGLE_API_KEY || '', enumerable: false });

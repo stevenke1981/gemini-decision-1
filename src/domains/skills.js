@@ -2,8 +2,10 @@
 // as a `/name` command, or by a distinctive hyphenated name, is forced. The others are shortlisted by BM25 over name and
 // description. In `auto` mode Gemini answers one predicate per shortlisted skill; the rules
 // (`heuristic`) keep the lexical leaders instead. See docs/design.md §4.2.
+import path from 'node:path';
+import { isWithin, realWithinAny } from '../paths.js';
 import { createBm25, excerpt } from '../text.js';
-import { verdict, certainty, mean, indexId } from '../contract.js';
+import { verdict, certainty, mean, indexId, redact } from '../contract.js';
 import { predicateProbability } from '../gemini/answers.js';
 
 /** A lexical hit must score at least this share of the best hit's score ... */
@@ -61,11 +63,39 @@ function normalizeCatalog(catalog) {
   return out;
 }
 
-function normalizeDirs(dirs) {
+/**
+ * The folders a request may scan: the entries of skills.dirs and the working folder, absolute.
+ * @param {object} cfg
+ * @returns {string[]}
+ */
+function allowedDirs(cfg) {
+  const cwd = cfg.cwd ?? process.cwd();
+  return [...cfg.skills.dirs.map((d) => path.resolve(cwd, d)), path.resolve(cwd)];
+}
+
+/** Request dirs as absolute paths; each must be, or lie below, an allowed folder. */
+function normalizeDirs(dirs, cfg) {
   if (!Array.isArray(dirs) || !dirs.every((d) => typeof d === 'string' && d.trim())) {
     throw fail('dirs must be an array of folder paths');
   }
-  return [...dirs];
+  const cwd = cfg.cwd ?? process.cwd();
+  const allowed = allowedDirs(cfg);
+  return dirs.map((d) => {
+    const abs = path.resolve(cwd, d);
+    if (!allowed.some((base) => isWithin(base, abs))) {
+      throw fail(`dir ${abs} is outside skills.dirs and the working folder`);
+    }
+    return abs;
+  });
+}
+
+/** A requested dir that is a link (symlink, junction) must still resolve inside the allowed folders. */
+function assertRealDirsAllowed(dirs, cfg) {
+  const allowed = allowedDirs(cfg);
+  for (const dir of dirs) {
+    const { ok, real } = realWithinAny(allowed, dir);
+    if (!ok) throw fail(`dir ${dir} resolves to ${real}, outside skills.dirs and the working folder`);
+  }
 }
 
 /** Validates the input and returns a new object; the catalog entries are copied and checked. */
@@ -77,14 +107,18 @@ function normalize(input, cfg) {
     task: input.task.trim(),
     maxSkills: input.maxSkills ?? cfg.skills.maxSkills,
     ...(input.catalog !== undefined ? { catalog: normalizeCatalog(input.catalog) } : {}),
-    ...(input.dirs !== undefined ? { dirs: normalizeDirs(input.dirs) } : {}),
+    ...(input.dirs !== undefined ? { dirs: normalizeDirs(input.dirs, cfg) } : {}),
   };
 }
 
-/** Loads the catalog from `deps.loadCatalog` only when the input carries none. */
+/**
+ * Loads the catalog from `deps.loadCatalog` only when the input carries none. Dirs the request
+ * chose are checked again by real path; dirs from the config are trusted.
+ */
 async function prepare(input, cfg, deps) {
   if (input.catalog !== undefined) return { ...input };
   if (typeof deps?.loadCatalog !== 'function') throw fail('no catalog loader in deps');
+  if (input.dirs !== undefined) assertRealDirsAllowed(input.dirs, cfg);
   const catalog = await deps.loadCatalog(input.dirs ?? cfg.skills.dirs);
   return { ...input, catalog: normalizeCatalog(catalog) };
 }
@@ -149,9 +183,9 @@ function plan(input, cfg) {
   const ids = shortlist.map((_, i) => indexId('s', i));
   return {
     state: {
-      task: excerpt(input.task, TASK_CHARS),
+      task: excerpt(redact(input.task), TASK_CHARS),
       skills: shortlist.map(({ skill }, i) => ({
-        id: ids[i], name: skill.name, description: excerpt(skill.description, DESCRIPTION_CHARS),
+        id: ids[i], name: skill.name, description: excerpt(redact(skill.description), DESCRIPTION_CHARS),
       })),
     },
     questions: shortlist.map(({ skill }, i) => ({

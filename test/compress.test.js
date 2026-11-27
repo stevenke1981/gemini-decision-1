@@ -19,6 +19,7 @@ const SUMMARIZE = 'summarize';
 const DROP = 'drop';
 const ACTIONS = [KEEP, SUMMARIZE, DROP];
 const ESCALATED = 'rules escalated to reach the target ratio';
+const USER_GUARDED = 'rules protected user instructions: no user segment dropped, the first user segment kept';
 
 /** A loaded config; the temp home is removed right away (the config lives in memory). */
 function cfgWith(overrides) {
@@ -404,6 +405,120 @@ test('escalation does not count a move that saves no tokens as a change', () => 
   assert.deepEqual(res.actions, {});
 });
 
+// Four eligible segments of about 733 tokens each (about 55 summarized): the first user message at
+// turn 0, a tool at 1, an assistant at 2 and a later user message at 3; plus a recent user segment.
+function orderInput(recentTokens) {
+  return compress.normalize({
+    window: 10000,
+    segments: [
+      seg('u0', 'user', 0, log('u')),
+      seg('t1', 'tool', 1, log('t')),
+      seg('a2', 'assistant', 2, log('a')),
+      seg('u3', 'user', 3, log('v')),
+      seg('r9', 'user', 9, 'recent', { tokens: recentTokens }),
+    ],
+  });
+}
+
+test('escalate summarizes tool output, then assistant text, before touching any user segment', () => {
+  // Oldest first regardless of role would have summarized the turn-0 user message first.
+  const res = escalate({}, orderInput(3000), CFG);
+  assert.equal(res.changed, true);
+  assert.deepEqual(res.actions, { t1: SUMMARIZE, a2: SUMMARIZE });
+});
+
+test('escalate drops summarized tool output before summarizing a user segment', () => {
+  const res = escalate({}, orderInput(3450), CFG);
+  assert.deepEqual(res.actions, { t1: DROP, a2: SUMMARIZE });
+});
+
+test('escalate summarizes later user segments only as a last resort and never the first user segment', () => {
+  const res = escalate({}, orderInput(9000), CFG);
+  assert.deepEqual(res.actions, { t1: DROP, a2: SUMMARIZE, u3: SUMMARIZE });
+  assert.equal(res.actions.u0, undefined, 'the first user segment is never escalated');
+  assert.ok(Object.values(res.actions).filter((a) => a === DROP).length === 1, 'only the tool segment is dropped');
+});
+
+test('the protected user segment is the one with the lowest turn, ties broken by input order', () => {
+  const input = compress.normalize({
+    window: 10000,
+    segments: [
+      seg('late', 'user', 2, log('l')),
+      seg('first', 'user', 0, log('f')),
+      seg('twin', 'user', 0, log('w')),
+      seg('r9', 'user', 9, 'recent', { tokens: 9000 }),
+    ],
+  });
+  const res = escalate({}, input, CFG);
+  assert.deepEqual(res.actions, { twin: SUMMARIZE, late: SUMMARIZE });
+});
+
+test('heuristic keeps a long task statement in the first user segment and summarizes the assistant note', () => {
+  const segments = [
+    seg('task', 'user', 0, log('requirement', 120)),
+    seg('note', 'assistant', 0, log('note', 20)),
+    seg('cur', 'user', 10, 'now'),
+  ];
+  const v = compress.heuristic(inputAt(segments, 0.9), CFG);
+  assert.equal(v.result.compact, true);
+  assert.equal(v.result.actions.task, KEEP, 'the user requirements are kept verbatim');
+  assert.equal(v.result.actions.note, SUMMARIZE);
+  assert.ok(v.reasons.includes(ESCALATED));
+  assert.equal(v.result.targetMet, false, 'the target is out of reach without cutting the task statement');
+});
+
+test('gate turns a Gemini drop of a user segment into summarize and keeps the first user segment', () => {
+  const input = compress.normalize({ window: 100000, segments: orderInput(100).segments });
+  const gemini = {
+    result: { compact: true, actions: { u0: SUMMARIZE, t1: DROP, a2: KEEP, u3: DROP, r9: KEEP } },
+    confidence: 0.7,
+    reasons: ['forced'],
+  };
+  const gated = compress.gate(gemini, null, input, CFG);
+  assert.equal(gated.source, 'gemini+rules');
+  assert.deepEqual(gated.result.actions, { u0: KEEP, t1: DROP, a2: KEEP, u3: SUMMARIZE, r9: KEEP });
+  assert.deepEqual(gated.reasons, ['forced', USER_GUARDED], 'under the target: no escalation');
+  assert.equal(gated.confidence, 0.7);
+  assert.equal(gated.result.targetMet, true);
+  const dropFirst = { ...gemini, result: { compact: true, actions: { u0: DROP } } };
+  assert.equal(compress.gate(dropFirst, null, input, CFG).result.actions.u0, KEEP);
+});
+
+test('gate reports both the user guard and the escalation when both change Gemini actions', () => {
+  const input = orderInput(9000);
+  const gemini = { result: { compact: true, actions: { u0: DROP, t1: KEEP, a2: KEEP, u3: KEEP, r9: KEEP } }, confidence: 0.6, reasons: [] };
+  const gated = compress.gate(gemini, null, input, CFG);
+  assert.equal(gated.source, 'gemini+rules');
+  assert.deepEqual(gated.reasons, [USER_GUARDED, ESCALATED]);
+  assert.deepEqual(gated.result.actions, { u0: KEEP, t1: DROP, a2: SUMMARIZE, u3: SUMMARIZE, r9: KEEP });
+});
+
+/** targetMet is a boolean and agrees with ratioAfter and targetRatio. */
+function assertTargetMet(result, expected) {
+  assert.equal(typeof result.targetMet, 'boolean');
+  assert.equal(result.targetMet, result.ratioAfter <= CFG.compress.targetRatio);
+  if (expected !== undefined) assert.equal(result.targetMet, expected);
+}
+
+test('targetMet is present and consistent on the settled, rules, Gemini, gate and finalize paths', () => {
+  assertTargetMet(compress.plan(inputAt(bandSegments(), 0.5), CFG).settled.result, true);
+  assertTargetMet(compress.plan(inputAt(bandSegments(), 0.55), CFG).settled.result, false);
+  const nothing = compress.plan(inputAt([seg('cur', 'user', 0, log('cur', 30))], 0.9), CFG).settled;
+  assertTargetMet(nothing.result, false);
+  const input = inputAt(bandSegments(), 0.7);
+  const rules = compress.heuristic(input, CFG);
+  assertTargetMet(rules.result, true);
+  assertTargetMet(compress.finalize(rules, input, CFG).result, true);
+  const p = planOrFail(input);
+  const kept = compress.interpret(answersFor(p.questions, { choose: () => KEEP }), p.ctx, CFG);
+  assertTargetMet(kept.result, false);
+  const gated = compress.gate(kept, rules, input, CFG);
+  assertTargetMet(gated.result, true);
+  assertTargetMet(compress.finalize(gated, input, CFG).result, true);
+  const declined = compress.interpret(answersFor(p.questions, { compactP: 0.1 }), p.ctx, CFG);
+  assertTargetMet(compress.finalize(declined, input, CFG).result, false);
+});
+
 test('the rules summarize tool output above 500 tokens and assistant text above 800, not at those sizes', () => {
   const segments = [
     seg('tool-at', 'tool', 5, log('a'), { tokens: TOOL_SUMMARIZE_TOKENS }),
@@ -571,7 +686,7 @@ test('the state carries excerpts, not whole texts, and the goal is cut to 1000 c
   const [s] = p.state.segments;
   assert.ok(s.text.length <= CFG.compress.excerptChars, `excerpt ${s.text.length} chars`);
   assert.ok(s.text.includes(' … '), 'the excerpt keeps the tail');
-  assert.equal(s.keepTail, true);
+  assert.deepEqual(Object.keys(s).sort(), ['age', 'id', 'role', 'text', 'tokens'], 'no implementation details such as keepTail');
   assert.equal(s.age, 9);
   assert.deepEqual(Object.keys(p.state).sort(), ['goal', 'segments', 'usage']);
 });
