@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createEngine, buildDeps } from '../src/engine.js';
 import { loadConfig } from '../src/config.js';
+import { InputError } from '../src/errors.js';
 import { verdict } from '../src/contract.js';
 import { predicateProbability } from '../src/gemini/answers.js';
 import { USD_PER_INPUT_TOKEN } from '../src/gemini/client.js';
@@ -240,6 +241,16 @@ test('unknown kind is a TypeError, from decide and from a shortcut whose kind is
   const engine = createEngine({ config: configFor(home, { mode: 'heuristic' }), kinds: { alpha: stub('alpha') } });
   await assert.rejects(engine.decide('nope', { task: 'x' }), (err) => err instanceof TypeError && /unknown kind/.test(err.message));
   await assert.rejects(engine.compress({ task: 'x' }), TypeError);
+}));
+
+test('a TypeError from normalize reaches the caller as an InputError (INVALID_INPUT); one thrown later stays a plain TypeError', () => withHome(async (home) => {
+  const bad = { ...stub('alpha'), normalize: () => { throw new TypeError('alpha: task must be a non-empty string'); } };
+  const buggy = { ...stub('beta'), heuristic: () => { throw new TypeError("Cannot read properties of undefined (reading 'x')"); } };
+  const engine = createEngine({ config: configFor(home, { mode: 'heuristic' }), kinds: { alpha: bad, beta: buggy } });
+  await assert.rejects(engine.decide('alpha', {}), (err) => err instanceof InputError && err instanceof TypeError
+    && err.code === 'INVALID_INPUT' && err.message === 'alpha: task must be a non-empty string' && err.cause instanceof TypeError);
+  await assert.rejects(engine.decide('nope', {}), (err) => err instanceof InputError && err.code === 'INVALID_INPUT');
+  await assert.rejects(engine.decide('beta', { task: 'x' }), (err) => err instanceof TypeError && !(err instanceof InputError));
 }));
 
 test('stats count decisions, calls, cost and fallbacks by kind, and return a copy', () => withHome(async (home) => {

@@ -183,6 +183,11 @@ test('a tool call the engine rejects is isError true with the message, not a pro
     assert.equal(replies[0].result.isError, true);
     assert.match(replies[0].result.content[0].text, /route: task must be a non-empty string/);
     assert.match(replies[1].result.content[0].text, /no eligible model/);
+    assert.equal(JSON.parse(replies[0].result.content[0].text).errorCode, 'INVALID_INPUT');
+    const buggy = { decide: async () => { throw new TypeError("Cannot read properties of undefined (reading 'models')"); }, stats: () => ({}) };
+    const internal = await exchange(buggy, [call(3, 'gemini_route', { task: 'add a flag' })]);
+    assert.equal(internal.replies[0].result.isError, true);
+    assert.equal(JSON.parse(internal.replies[0].result.content[0].text).errorCode, 'INTERNAL_ERROR');
   } finally {
     h.cleanup();
   }

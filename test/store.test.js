@@ -534,6 +534,37 @@ test('update and remove append the record as it was to memory.jsonl.history; add
   });
 });
 
+test('purgeHistory erases the entries of one record or all of them, keeps the rest, and removes an emptied file', () => {
+  withDir((dir) => {
+    const file = path.join(dir, FILE);
+    const history = `${file}.history`;
+    const store = storeIn(dir);
+    assert.equal(store.purgeHistory(), 0, 'no history file yet');
+    const a = store.add({ type: 'user', text: 'Old fact' });
+    const b = store.add({ type: 'user', text: 'Doomed fact' });
+    store.update(a.id, { text: 'Newer fact' });
+    store.update(a.id, { text: 'Newest fact' });
+    store.remove(b.id);
+    fs.appendFileSync(history, 'not json' + '\n');
+
+    assert.equal(store.purgeHistory('m_unknown'), 0);
+    assert.equal(store.purgeHistory(a.id), 2);
+    const left = fs.readFileSync(history, 'utf8').trimEnd().split('\n');
+    assert.equal(left.length, 2, 'the other record and the unreadable line stay');
+    assert.equal(JSON.parse(left[0]).record.text, 'Doomed fact');
+    assert.equal(left[1], 'not json');
+    assert.ok(!fs.readFileSync(history, 'utf8').includes('Old fact'));
+    assert.equal(store.get(a.id).text, 'Newest fact', 'the stored memory is untouched');
+
+    assert.equal(store.purgeHistory(b.id), 1, 'a removed record is purged by its id');
+    assert.equal(store.purgeHistory(), 1, 'without an id the unreadable line goes too');
+    assert.equal(fs.existsSync(history), false);
+    assert.equal(fs.existsSync(`${file}.lock`), false);
+    assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.tmp')), []);
+    for (const bad of ['', '  ', 7, null]) assert.throws(() => store.purgeHistory(bad), /id must be a non-empty string/);
+  });
+});
+
 test('a remove of an unknown id writes no history, and the history is written before the store is replaced', (t) => {
   withDir((dir) => {
     const file = path.join(dir, FILE);

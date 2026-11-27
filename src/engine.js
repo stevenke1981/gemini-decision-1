@@ -3,7 +3,7 @@
 // the rules → finalize → ledger. Modes: `auto` falls back to the rules on any Gemini error; `gemini`
 // fails the decision after it is logged; `heuristic` is rules only and never calls the transport.
 // The registry and the default deps are imported lazily, only when they are not injected.
-import { DecisionError, errorCode } from './errors.js';
+import { DecisionError, InputError, asInputError, errorCode } from './errors.js';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { askGemini, callCost, postDecision, validateQuestions } from './gemini/client.js';
@@ -184,6 +184,15 @@ function upstreamFailure(ctx, err, meter) {
   return { error, source, spend: meter.snapshot() };
 }
 
+/** The kind's normalize, with its TypeError marked as the caller's mistake (an InputError). */
+function normalizeInput(mod, input, config) {
+  try {
+    return mod.normalize(input, config);
+  } catch (err) {
+    throw asInputError(err);
+  }
+}
+
 export function decisionErrorCode(error, fallback) {
   return errorCode(error, isGeminiFailure(error) ? 'GEMINI_TRANSPORT' : fallback);
 }
@@ -275,14 +284,14 @@ export function createEngine({ config, transport = postDecision, kinds, deps, le
 
   async function moduleFor(kind) {
     const modules = await getKinds();
-    if (!Object.hasOwn(modules, kind)) throw new TypeError(`unknown kind "${String(kind)}"`);
+    if (!Object.hasOwn(modules, kind)) throw new InputError(`unknown kind "${String(kind)}"`);
     return modules[kind];
   }
 
   async function decide(kind, input) {
     const mod = await moduleFor(kind);
     const t0 = performance.now();
-    const normalized = mod.normalize(input, config);
+    const normalized = normalizeInput(mod, input, config);
     const d = (mod.prepare || mod.finalize) ? await getDeps() : undefined;
     const prepared = (await mod.prepare?.(normalized, config, d)) ?? normalized;
     const step = await attempt(ctx, kind, mod, prepared);

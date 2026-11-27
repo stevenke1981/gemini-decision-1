@@ -3,8 +3,10 @@
 // one relevance predicate per candidate; the rules rank the candidates by their BM25 score.
 // Candidates come from the caller or from the repository index (prepare). The text sent to Gemini
 // is cut to excerptChars, and each span that looks like a secret is replaced by [redacted].
+import fs from 'node:fs';
 import path from 'node:path';
 import { GREETING, redact, certainty, indexId, mean, requireText, verdict } from '../contract.js';
+import { InputError } from '../errors.js';
 import { predicateProbability } from '../gemini/answers.js';
 import { isWithin, realWithinAny } from '../paths.js';
 import { estimateTokens, excerpt, tokenize } from '../text.js';
@@ -106,10 +108,23 @@ function shortlistOf(candidates, n) {
   return (scored ? [...candidates].sort((a, b) => b.score - a.score) : candidates).slice(0, n);
 }
 
-/** A root that is a link (symlink, junction) must still resolve inside the allowed folders. */
+/**
+ * A root that is a link (symlink, junction) must still resolve inside the allowed folders; one
+ * that does not is the caller's mistake (InputError).
+ */
 function assertRealRootAllowed(root, cfg) {
   const { ok, real } = realWithinAny(allowedBases(cfg), root);
-  if (!ok) throw new TypeError(`retrieve: root ${root} resolves to ${real}, outside the allowed folders`);
+  if (!ok) throw new InputError(`retrieve: root ${root} resolves to ${real}, outside the allowed folders`);
+}
+
+/** The index of `root`. A build that fails because the root is no folder is the caller's mistake. */
+async function indexOf(root, deps) {
+  try {
+    return await deps.repoIndex(root);
+  } catch (err) {
+    if (fs.statSync(root, { throwIfNoEntry: false })?.isDirectory()) throw err;
+    throw new InputError(`retrieve: root ${root} is not a folder`, { cause: err });
+  }
 }
 
 /** What the index says about its own completeness; missing values count as complete. */
@@ -124,7 +139,7 @@ const COMPLETE = Object.freeze({ truncated: false, skipped: 0 });
 async function searchRepo(input, cfg, deps) {
   if (typeof deps?.repoIndex !== 'function') throw new Error('retrieve: root given but no repoIndex dependency');
   assertRealRootAllowed(input.root, cfg);
-  const index = await deps.repoIndex(input.root);
+  const index = await indexOf(input.root, deps);
   return { candidates: index.search(input.query, cfg.retrieve.shortlist), ...completenessOf(index) };
 }
 

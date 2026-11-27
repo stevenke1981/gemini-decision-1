@@ -34,7 +34,8 @@ Commands:
   retrieve --query Q           context chunks     [--root R] [--budget N] [--force]
   recall --query Q             stored memories that apply
   memories                     every stored memory, as a JSON array
-  forget --id ID               delete one stored memory
+  forget --id ID               delete one stored memory   [--purge] also erases its earlier versions
+  purge-history                erase the earlier versions kept beside the store   [--id ID] one memory's only
   remember --text T            save, update or skip a memory   [--source user|agent|tool] [--dry-run]
   compress --file FILE         compact a transcript; FILE holds the input object as JSON
   serve [--port N]             HTTP sidecar on 127.0.0.1 (default port 8792)
@@ -72,7 +73,8 @@ const COMMANDS = Object.freeze({
   retrieve: { options: { query: str, root: str, budget: str, force: flag }, run: runRetrieve },
   recall: { options: { query: str }, run: runRecall },
   memories: { options: {}, run: runMemories },
-  forget: { options: { id: str }, run: runForget },
+  forget: { options: { id: str, purge: flag }, run: runForget },
+  'purge-history': { options: { id: str }, run: runPurgeHistory },
   remember: { options: { text: str, source: str, 'dry-run': flag }, run: runRemember },
   compress: { options: { file: str }, run: runCompress },
   serve: { options: { port: str }, run: runServe },
@@ -267,12 +269,25 @@ async function runMemories({ values, io }) {
   return EXIT.OK;
 }
 
-/** Deletes the memory with the given id; an unknown id is an error (exit 1). */
+/** Deletes the memory with the given id; an unknown id is an error (exit 1). --purge also erases its history. */
 async function runForget({ values, io }) {
   const id = requireOption(values, 'id');
   const config = configFor(io, values);
-  if (!createMemoryStore(config.memory.path).remove(id)) throw new Error(`no memory has id "${id}"`);
-  writeJson(io.stdout, { removed: true, id });
+  const store = createMemoryStore(config.memory.path);
+  if (!store.remove(id)) throw new Error(`no memory has id "${id}"`);
+  writeJson(io.stdout, { removed: true, id, ...(values.purge ? { purged: store.purgeHistory(id) } : {}) });
+  return EXIT.OK;
+}
+
+/**
+ * Erases the earlier versions of updated and removed memories from the history file: all of
+ * them, or with --id only one memory's (also one already forgotten). Prints how many.
+ */
+async function runPurgeHistory({ values, io }) {
+  const config = configFor(io, values);
+  const { id } = values;
+  if (id !== undefined && !id.trim()) throw new UsageError('--id must not be empty');
+  writeJson(io.stdout, { purged: createMemoryStore(config.memory.path).purgeHistory(id) });
   return EXIT.OK;
 }
 

@@ -512,6 +512,43 @@ test('memories prints every stored memory as a JSON array, and forget removes on
   }
 });
 
+test('forget --purge and purge-history erase the earlier versions that forget alone leaves in the history file', async () => {
+  const f = fixture();
+  try {
+    const history = path.join(f.dir, 'memory.jsonl.history');
+    const remember = async (text) => {
+      const saved = await run(f, ['remember', '--text', text, '--source', 'user', '--mode', 'heuristic']);
+      assert.equal(saved.code, EXIT.OK, saved.err);
+      return saved.json().result.memory.id;
+    };
+    const first = await remember('Remember: my door code is on the fridge');
+    const second = await remember('Remember: the staging server is called walnut');
+    const third = await remember('Remember: I prefer tabs over spaces');
+
+    assert.equal((await run(f, ['forget', '--id', first])).code, EXIT.OK);
+    assert.match(fs.readFileSync(history, 'utf8'), /door code/, 'forget alone keeps the text in the history');
+
+    const purged = await run(f, ['forget', '--id', second, '--purge']);
+    assert.equal(purged.code, EXIT.OK, purged.err);
+    assert.deepEqual(purged.json(), { removed: true, id: second, purged: 1 });
+    assert.doesNotMatch(fs.readFileSync(history, 'utf8'), /walnut/);
+    assert.match(fs.readFileSync(history, 'utf8'), /door code/);
+
+    const one = await run(f, ['purge-history', '--id', first]);
+    assert.equal(one.code, EXIT.OK, one.err);
+    assert.deepEqual(one.json(), { purged: 1 });
+    assert.equal(fs.existsSync(history), false);
+
+    assert.equal((await run(f, ['forget', '--id', third])).code, EXIT.OK);
+    assert.deepEqual((await run(f, ['purge-history'])).json(), { purged: 1 });
+    assert.deepEqual((await run(f, ['purge-history'])).json(), { purged: 0 });
+    assert.equal((await run(f, ['purge-history', '--id', ''])).code, EXIT.USAGE);
+    assert.match((await run(f, ['--help'])).out, /purge-history/);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test('forget without --id is a usage error, and the usage text lists both new commands', async () => {
   const f = fixture();
   try {
