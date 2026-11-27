@@ -4,13 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { chunkFile, assertChunkOptions } from '../src/index/chunker.js';
-import { createRepoIndex } from '../src/index/repo.js';
+import { createRepoIndex, createRepoIndexAsync } from '../src/index/repo.js';
 import { loadConfig } from '../src/config.js';
 
 const numbered = (n) => Array.from({ length: n }, (_, i) => `line${i + 1}`).join('\n');
 
 async function withDir(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-index-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-index-'));
   try {
     return await fn(dir);
   } finally {
@@ -116,13 +116,29 @@ test('createRepoIndex stops at maxFiles and visits folders depth first in name o
   assert.ok(index.chunks.every((c) => index.files.includes(c.source)));
 }));
 
-test('createRepoIndex never follows a symlinked or junctioned folder, nor a symlinked file', () => withDir(async (dir) => {
+// A junction needs no privilege on Windows; on Linux and macOS it is an ordinary symlink.
+test('createRepoIndex never follows a symlinked or junctioned folder', () => withDir(async (dir) => {
   const outside = path.join(dir, 'outside');
   const repo = path.join(dir, 'repo');
   writeFiles(outside, { 'secret.js': 'const LEAK_MARKER = 1;\n' });
   writeFiles(repo, { 'src/a.js': 'const ok = 1;\n' });
   fs.symlinkSync(outside, path.join(repo, 'linked'), 'junction');
-  fs.symlinkSync(path.join(outside, 'secret.js'), path.join(repo, 'leak.js'), 'file');
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['src/a.js']);
+  assert.ok(!index.chunks.some((c) => c.text.includes('LEAK_MARKER')));
+}));
+
+test('createRepoIndex never follows a symlinked file', (t) => withDir(async (dir) => {
+  const outside = path.join(dir, 'outside');
+  const repo = path.join(dir, 'repo');
+  writeFiles(outside, { 'secret.js': 'const LEAK_MARKER = 1;\n' });
+  writeFiles(repo, { 'src/a.js': 'const ok = 1;\n' });
+  try {
+    fs.symlinkSync(path.join(outside, 'secret.js'), path.join(repo, 'leak.js'), 'file');
+  } catch (err) {
+    if (err.code === 'EPERM') return t.skip('creating a file symlink needs a privilege on this machine');
+    throw err;
+  }
   const index = createRepoIndex(repo, cfgFor(dir).retrieve);
   assert.deepEqual(index.files, ['src/a.js']);
   assert.ok(!index.chunks.some((c) => c.text.includes('LEAK_MARKER')));
@@ -307,4 +323,284 @@ test('createRepoIndex rejects a non-positive maxWalkMs and a clock that is not a
   const type = (fn, re) => assert.throws(fn, (e) => e instanceof TypeError && re.test(e.message));
   type(() => createRepoIndex(dir, { ...cfgFor(dir).retrieve, maxWalkMs: 0 }), /maxWalkMs/);
   type(() => createRepoIndex(dir, cfgFor(dir).retrieve, { now: 5 }), /now must be a function/);
+}));
+
+// --- .gitignore -------------------------------------------------------------------------------
+
+// respectGitignore may be absent from the merged config until the default lists it; it means true.
+const withGitignore = (dir, value, retrieve = {}) => ({ ...cfgFor(dir, retrieve).retrieve, respectGitignore: value });
+
+const ROOT_GITIGNORE_TREE = {
+  '.gitignore': '# local files\nsettings.local.json\nout/\n*.secret.md\n',
+  'settings.local.json': '{"token": "LOCAL_MARKER"}\n',
+  'src/settings.local.json': '{"token": "LOCAL_MARKER"}\n',
+  'out/bundle.js': 'generated\n',
+  'notes.secret.md': 'LOCAL_MARKER\n',
+  'README.md': '# Read me\n',
+  'src/a.js': 'const a = 1;\n',
+};
+
+test('createRepoIndex leaves out what the root .gitignore ignores and counts it', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, ROOT_GITIGNORE_TREE);
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['README.md', 'src/a.js']);
+  assert.equal(index.ignored, 4, 'two settings files, the out/ folder and the secret note');
+  assert.equal(index.skipped, 0);
+  assert.ok(!index.chunks.some((c) => c.text.includes('LOCAL_MARKER')));
+}));
+
+test('createRepoIndex indexes gitignored files when respectGitignore is false and counts none', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, ROOT_GITIGNORE_TREE);
+  const index = createRepoIndex(repo, withGitignore(dir, false));
+  assert.deepEqual(index.files, ['README.md', 'notes.secret.md', 'out/bundle.js', 'settings.local.json', 'src/a.js', 'src/settings.local.json']);
+  assert.equal(index.ignored, 0);
+}));
+
+test('createRepoIndex treats an absent respectGitignore as true and rejects values other than true or false', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, ROOT_GITIGNORE_TREE);
+  const absent = createRepoIndex(repo, withGitignore(dir, undefined));
+  assert.deepEqual(absent.files, ['README.md', 'src/a.js']);
+  assert.deepEqual(createRepoIndex(repo, withGitignore(dir, true)).files, absent.files);
+  for (const bad of ['yes', 1, null, 0]) {
+    assert.throws(() => createRepoIndex(repo, withGitignore(dir, bad)), (e) => e instanceof TypeError && /respectGitignore/.test(e.message));
+  }
+}));
+
+test('a nested .gitignore overrides the root one, and "!" re-includes', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, {
+    '.gitignore': '*.md\n!README.md\n',
+    'README.md': 'readme\n',
+    'a.md': 'a\n',
+    'keep.md': 'root keep\n',
+    'docs/.gitignore': '!keep.md\n/local.json\n',
+    'docs/keep.md': 'keep\n',
+    'docs/drop.md': 'drop\n',
+    'docs/sub/keep.md': 'deeper keep\n',
+    'docs/local.json': '{}\n',
+    'docs/sub/local.json': '{}\n',
+    'local.json': '{}\n',
+  });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['README.md', 'docs/keep.md', 'docs/sub/keep.md', 'docs/sub/local.json', 'local.json']);
+  assert.equal(index.ignored, 4, 'a.md, keep.md at the root, docs/drop.md and docs/local.json');
+}));
+
+test('a folder-only rule leaves out folders but not files of the same name', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, {
+    '.gitignore': 'scratch*/\n',
+    'scratch/a.js': 'a\n',
+    'src/scratchpad/b.js': 'b\n',
+    'scratch.js': 'kept\n',
+    'src/c.js': 'c\n',
+  });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['scratch.js', 'src/c.js']);
+  assert.equal(index.ignored, 2);
+}));
+
+test('an ignored folder is not entered, so nothing inside it can be re-included', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, {
+    '.gitignore': 'private/\n!private/keep.js\n',
+    'private/.gitignore': '!*\n',
+    'private/keep.js': 'keep\n',
+    'private/sub/x.js': 'x\n',
+    'pub.js': 'pub\n',
+  });
+  const realReaddir = fs.readdirSync;
+  const listed = [];
+  t.mock.method(fs, 'readdirSync', (p, o) => {
+    listed.push(path.relative(repo, String(p)));
+    return realReaddir(p, o);
+  });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['pub.js']);
+  assert.equal(index.ignored, 1, 'the folder counts once; what lies below it is never seen');
+  assert.deepEqual(listed, ['']);
+}));
+
+test('a .gitignore outside the indexed root is not read', () => withDir(async (dir) => {
+  writeFiles(dir, { '.gitignore': '*.js\n' });
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n' });
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['a.js']);
+  assert.equal(index.ignored, 0);
+}));
+
+test('an unreadable or oversized .gitignore gives no rules and never fails the index', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { '.gitignore': 'a.js\n', 'a.js': 'a\n', 'sub/.gitignore': `${'#'.repeat(60)}\nb.js\n`, 'sub/b.js': 'b\n' });
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    if (path.relative(repo, String(p)) === '.gitignore') throw refused('EACCES');
+    return realRead(p, o);
+  });
+  const index = createRepoIndex(repo, cfgFor(dir, { maxFileBytes: 40 }).retrieve);
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['a.js', 'sub/b.js']);
+  assert.equal(index.ignored, 0);
+  assert.equal(index.skipped, 2, 'each .gitignore whose rules were lost is reported as skipped');
+}));
+
+// A junction needs no privilege on Windows; on Linux and macOS it is an ordinary symlink.
+test('a .gitignore that is a junction is not followed and gives no rules', () => withDir(async (dir) => {
+  const outside = path.join(dir, 'outside');
+  const repo = path.join(dir, 'repo');
+  fs.mkdirSync(outside);
+  writeFiles(repo, { 'a.js': 'a\n' });
+  fs.symlinkSync(outside, path.join(repo, '.gitignore'), 'junction');
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['a.js']);
+  assert.equal(index.ignored, 0);
+}));
+
+test('a .gitignore that is a file symlink is not followed and gives no rules', (t) => withDir(async (dir) => {
+  const outside = path.join(dir, 'outside');
+  const repo = path.join(dir, 'repo');
+  writeFiles(outside, { rules: '*.js\n' });
+  writeFiles(repo, { 'a.js': 'a\n' });
+  try {
+    fs.symlinkSync(path.join(outside, 'rules'), path.join(repo, '.gitignore'), 'file');
+  } catch (err) {
+    if (err.code === 'EPERM') return t.skip('creating a file symlink needs a privilege on this machine');
+    throw err;
+  }
+  const index = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(index.files, ['a.js']);
+  assert.equal(index.ignored, 0);
+}));
+
+// --- createRepoIndexAsync ---------------------------------------------------------------------
+
+const MIXED_TREE = {
+  ...ROOT_GITIGNORE_TREE,
+  'docs/.gitignore': '!*.secret.md\n',
+  'docs/plan.secret.md': 'plan about the cache\n',
+  'src/cache.js': 'function cacheGet(key) {\n  return store.get(key);\n}\n',
+  'src/deep/parse.js': `${numbered(30)}\n`,
+  'node_modules/x/index.js': 'ignored\n',
+  'bin.js': Buffer.from('ab\u0000cd'),
+};
+
+/** The fields of an index that deepEqual can compare, plus a few searches. */
+function snapshot(index) {
+  const { files, chunks, skipped, truncated, ignored } = index;
+  const searches = ['cache', 'line12 line13', 'read me', 'zzzz'].map((q) => index.search(q, 5));
+  return { files, chunks, skipped, truncated, ignored, searches };
+}
+
+test('createRepoIndexAsync builds the same index as createRepoIndex', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, MIXED_TREE);
+  for (const retrieve of [{}, { maxFiles: 3 }, { chunkLines: 4, chunkOverlap: 1 }]) {
+    const rcfg = cfgFor(dir, retrieve).retrieve;
+    const sync = createRepoIndex(repo, rcfg);
+    const pending = createRepoIndexAsync(repo, rcfg);
+    assert.ok(pending instanceof Promise);
+    const built = await pending;
+    assert.deepEqual(snapshot(built), snapshot(sync));
+    assert.ok(Object.isFrozen(built) && Object.isFrozen(built.files) && Object.isFrozen(built.chunks));
+    assert.ok(built.ignored > 0);
+  }
+  const off = withGitignore(dir, false);
+  assert.deepEqual(snapshot(await createRepoIndexAsync(repo, off)), snapshot(createRepoIndex(repo, off)));
+}));
+
+test('createRepoIndexAsync gives the event loop a turn while it builds', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  const count = 300;
+  writeFiles(repo, Object.fromEntries(Array.from({ length: count }, (_, i) => [`f/${String(i).padStart(3, '0')}.js`, `const v${i} = ${i};\n`])));
+  // Each read takes at least half a millisecond, so the build lasts well over one time slice
+  // however fast the disk is.
+  const realRead = fs.readFileSync;
+  t.mock.method(fs, 'readFileSync', (p, o) => {
+    const until = performance.now() + 0.5;
+    while (performance.now() < until);
+    return realRead(p, o);
+  });
+  let timerFired = false;
+  setTimeout(() => { timerFired = true; }, 0);
+  const index = await createRepoIndexAsync(repo, cfgFor(dir).retrieve).then((built) => {
+    assert.equal(timerFired, true, 'the timer ran before the build finished');
+    return built;
+  });
+  t.mock.restoreAll();
+  assert.equal(index.files.length, count);
+}));
+
+test('createRepoIndexAsync stops once maxWalkMs has passed on an injected clock', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'a\n', 'b.js': 'b\n', 'c.js': 'c\n' });
+  const realRead = fs.readFileSync;
+  const build = async (fn, maxWalkMs) => {
+    let time = 0;
+    t.mock.method(fs, 'readFileSync', (p, o) => {
+      const text = realRead(p, o);
+      time += 1000;
+      return text;
+    });
+    const index = await fn(repo, cfgFor(dir, { maxWalkMs }).retrieve, { now: () => time });
+    t.mock.restoreAll();
+    return index;
+  };
+  const cut = await build(createRepoIndexAsync, 1500);
+  assert.deepEqual(cut.files, ['a.js', 'b.js']);
+  assert.equal(cut.truncated, true);
+  assert.equal(cut.skipped, 0);
+  assert.deepEqual(snapshot(cut), snapshot(await build(createRepoIndex, 1500)));
+  const exact = await build(createRepoIndexAsync, 1000);
+  assert.deepEqual(exact.files, ['a.js']);
+  assert.equal(exact.truncated, true);
+  const whole = await build(createRepoIndexAsync, 3500);
+  assert.deepEqual(whole.files, ['a.js', 'b.js', 'c.js']);
+  assert.equal(whole.truncated, false);
+}));
+
+test('createRepoIndexAsync rejects bad arguments with a TypeError and a missing folder with an Error', () => withDir(async (dir) => {
+  const rcfg = cfgFor(dir).retrieve;
+  const type = (promise, re) => assert.rejects(promise, (e) => e instanceof TypeError && re.test(e.message));
+  await assert.rejects(createRepoIndexAsync(path.join(dir, 'nope'), rcfg), (e) => e.constructor === Error && /not a folder/.test(e.message));
+  await type(createRepoIndexAsync('', rcfg), /root must be a non-empty string/);
+  await type(createRepoIndexAsync(dir, undefined), /rcfg must be the retrieve config object/);
+  await type(createRepoIndexAsync(dir, { ...rcfg, maxWalkMs: 0 }), /maxWalkMs/);
+  await type(createRepoIndexAsync(dir, { ...rcfg, respectGitignore: 'no' }), /respectGitignore/);
+  await type(createRepoIndexAsync(dir, rcfg, { now: 5 }), /now must be a function/);
+}));
+
+test('createRepoIndexAsync skips and counts refused folders like createRepoIndex', (t) => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'open/a.js': 'a\n', 'locked/b.js': 'b\n' });
+  const realReaddir = fs.readdirSync;
+  t.mock.method(fs, 'readdirSync', (p, o) => {
+    if (basename(p) === 'locked') throw refused('EACCES');
+    return realReaddir(p, o);
+  });
+  const index = await createRepoIndexAsync(repo, cfgFor(dir).retrieve);
+  t.mock.restoreAll();
+  assert.deepEqual(index.files, ['open/a.js']);
+  assert.equal(index.skipped, 1);
+}));
+
+test('a .gitignore that exists but cannot be used is counted in skipped, and one that is fine is not', () => withDir(async (dir) => {
+  const repo = path.join(dir, 'repo');
+  writeFiles(repo, { 'a.js': 'const a = 1;\n', 'sub/.gitignore': 'hidden.js\n', 'sub/hidden.js': 'const h = 1;\n', 'sub/shown.js': 'const s = 1;\n' });
+  const fine = createRepoIndex(repo, cfgFor(dir).retrieve);
+  assert.deepEqual(fine.files, ['a.js', 'sub/shown.js']);
+  assert.equal(fine.skipped, 0);
+  // Too large to read: its rules are lost, so the file it hid is indexed and the caller is told.
+  writeFiles(repo, { 'sub/.gitignore': `hidden.js\n${'# padding\n'.repeat(40)}` });
+  const lost = createRepoIndex(repo, cfgFor(dir, { maxFileBytes: 64 }).retrieve);
+  assert.deepEqual(lost.files, ['a.js', 'sub/hidden.js', 'sub/shown.js']);
+  assert.equal(lost.skipped, 1);
+  // A folder named .gitignore is not a rules file either.
+  fs.rmSync(path.join(repo, 'sub', '.gitignore'));
+  fs.mkdirSync(path.join(repo, 'sub', '.gitignore'));
+  assert.equal(createRepoIndex(repo, cfgFor(dir).retrieve).skipped, 1);
 }));

@@ -49,6 +49,8 @@ export const DEFAULTS = {
     allowedRoots: [],
     // A repository walk stops after this long; what was indexed so far is used.
     maxWalkMs: 5000,
+    // Skip files and folders that a .gitignore in the repository lists.
+    respectGitignore: true,
     shortlist: 12,
     threshold: 0.5,
     budgetTokens: 4000,
@@ -87,9 +89,13 @@ export const DEFAULTS = {
   ledger: {
     enabled: true,
     path: '',
+    // The ledger file is rotated to <file>.1 when it would grow past this many bytes.
+    maxBytes: 10 * 1024 * 1024,
   },
   server: {
     host: '127.0.0.1',
     port: 8792,
+    // The largest HTTP request body accepted, in bytes. A compress request for a large window is megabytes.
+    maxBodyBytes: 8 * 1024 * 1024,
   },
 };

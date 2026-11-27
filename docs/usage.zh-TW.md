@@ -98,7 +98,15 @@ gemini-core config
 
 `skills.dirs` 會掃描 `<目錄>/<技能名稱>/SKILL.md`。`retrieve.allowedRoots` 決定允許檢索哪些資料夾；空清單時只能檢索載入設定時的工作資料夾與其子目錄。連結解析後的實際路徑也必須在允許範圍內。
 
-`skills.dirs`、`retrieve.allowedRoots` 等敏感設定必須放在明確指定的設定檔，或工具家目錄的 `config.json`。直接放進工作資料夾自動發現的 `gemini-core.config.json` 會報錯。
+`skills.dirs`、`retrieve.allowedRoots`、`retrieve.respectGitignore`、`ledger.enabled` 等敏感設定必須放在明確指定的設定檔，或工具家目錄的 `config.json`。直接放進工作資料夾自動發現的 `gemini-core.config.json` 會報錯。
+
+檢索索引預設遵守索引根目錄內的 `.gitignore`（`retrieve.respectGitignore`，預設 `true`）：被 git 忽略的檔案不會被索引，也不會送到 Gemini。只讀 `.gitignore`，不讀 `.git/info/exclude` 或全域排除檔，也不會執行 `git`。在 Windows 與 macOS 上比對不分 ASCII 字母大小寫（與 git 的 `core.ignorecase` 預設一致），其他平台區分大小寫。`.gitignore` 存在但無法使用（是連結、讀不到或過大）時，結果的 `skipped` 會加一，表示原本該隱藏的檔案可能被索引。
+
+決策 ledger 超過 `ledger.maxBytes`（預設 10 MB）時會輪替成 `decisions.jsonl.1`，只保留這一份舊檔。
+
+設定檔採嚴格檢查：打錯或不存在的鍵（例如 `minConfidnce`）會在載入時報錯並指出鍵名，不會被默默忽略。
+
+透過 MCP 或 HTTP 傳入的 skills `dirs` 也受限制：每個目錄都必須位於 `skills.dirs` 或工作資料夾之內，否則請求會被拒絕。CLI 的 `--dir` 不受此限，因為它會把目錄加入當次的 `skills.dirs`。
 
 若要調整路由候選模型，可從 [設定範例](../gemini-core.config.example.json) 複製 `route.models` 到自己的設定檔。`tier` 越高代表排序越後面；`contextWindow`、`capabilities`、`efforts` 與 `strengths` 請依實際模型能力設定。這些值是路由依據，工具不會代你確認帳號是否有該模型的使用權。
 
@@ -146,7 +154,7 @@ gemini-core remember --text "記住：回答與文件請使用繁體中文" --dr
 gemini-core remember --text "記住：回答與文件請使用繁體中文"
 ```
 
-查看 `result.action`（`save_new`、`update`、`skip`）與 `result.applied`。重複、短暫或疑似秘密的內容可能被略過。
+查看 `result.action`（`save_new`、`update`、`skip`）與 `result.applied`。重複、短暫或疑似秘密的內容可能被略過。規則模式只保存 `--source user`（預設值）的內容；來源是 `agent` 或 `tool` 時一律略過，避免工具輸出變成長期指令。
 
 ### 讀取記憶
 
@@ -154,7 +162,19 @@ gemini-core remember --text "記住：回答與文件請使用繁體中文"
 gemini-core recall --query "回答與文件應該使用什麼語言"
 ```
 
-查看 `result.memories`。沒有相關記憶時會回傳空清單；規則模式主要依詞彙比對，Gemini 可再判斷候選記憶是否適用。
+查看 `result.memories`，每筆都附帶 `source`。沒有相關記憶時會回傳空清單；規則模式主要依詞彙比對，Gemini 可再判斷候選記憶是否適用。
+
+### 列出與刪除記憶
+
+```powershell
+# 列出全部記憶（JSON 陣列）
+gemini-core memories
+
+# 依 id 刪除一筆；id 不存在時結束碼為 1
+gemini-core forget --id m_0123456789
+```
+
+被更新或刪除的記憶，其舊內容會附加到記憶檔旁的 `memory.jsonl.history`（每行一筆 `{ at, op, record }`），誤刪時可從這裡找回。這個檔案只增不減，工具本身不會讀它。
 
 ### 壓縮上下文
 
@@ -287,7 +307,9 @@ CLI 以 exit code `0` 表示成功、`1` 表示執行失敗、`2` 表示指令�
 | MCP 有工具卻沒有自動換模型 | 工具提供建議，換模型由宿主能力或自訂 agent 流程執行 |
 | HTTP 403 | 服務拒絕帶 Origin 的瀏覽器請求，請使用伺服器端程式呼叫 |
 | HTTP 415 | 設定 `Content-Type: application/json` |
-| HTTP 413 | 縮小請求本體至 1 MB 以下 |
+| HTTP 413 | 縮小請求本體，或調高 `server.maxBodyBytes`（預設 8 MB） |
+| `unknown key "..."` | 設定檔有打錯或不支援的鍵，依訊息修正 |
+| `skills: dir ... is outside ...` | 把該目錄加入明確指定設定檔的 `skills.dirs` |
 
 CLI、MCP 與 HTTP 有自動化測試；Claude Code／Codex 宿主內的完整操作仍需在安裝後確認。本說明沒有代你新增全域 MCP 設定或執行付費 API 呼叫。
 

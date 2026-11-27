@@ -21,6 +21,8 @@ const BUCKET_OF_SOURCE = Object.freeze({ settled: 'settled', rules: 'rules', gem
 const DEP_KEYS = Object.freeze(['store', 'loadCatalog', 'repoIndex']);
 const NO_SPEND = Object.freeze({ calls: 0, cost: null, tokens: null });
 const EMPTY_KIND_STATS = Object.freeze({ decisions: 0, gemini: 0, rules: 0, settled: 0, fallbacks: 0 });
+// The most entries one cache keeps; each repository index holds all of its chunk text.
+const MAX_CACHE_ENTRIES = 8;
 const geminiFailures = new WeakSet();
 
 /** Recognizes strict Gemini failures without changing the error rethrown to library callers. */
@@ -42,19 +44,38 @@ function once(load) {
 
 const loadRegistry = once(async () => (await import('./registry.js')).KIND_MODULES);
 
+/** True for a thenable, such as the promise an async index build returns. */
+function isPromise(v) {
+  return v != null && typeof v.then === 'function';
+}
+
 /**
  * A cache of built values by key. An entry older than `ttlMs` is built again, so a long-running
- * serve or mcp sees edited files; `ttlMs` 0 keeps nothing and every call builds afresh.
+ * serve or mcp sees edited files; `ttlMs` 0 keeps nothing and every call builds afresh. Expired
+ * entries are dropped on every use, and at most MAX_CACHE_ENTRIES are kept (the oldest goes first).
+ * A value may be a promise: concurrent callers then share one build, and a promise that rejects is
+ * removed (if its entry is still the one cached), so the next call builds again.
  * @returns {(key: string, make: () => *) => *}
  */
 function ttlCache(ttlMs, now) {
   const entries = new Map();
   return (key, make) => {
-    const hit = entries.get(key);
-    if (ttlMs > 0 && hit && now() - hit.at <= ttlMs) return hit.value;
     const at = now();
+    for (const [k, e] of entries) if (at - e.at > ttlMs) entries.delete(k);
+    const hit = entries.get(key);
+    if (ttlMs > 0 && hit) return hit.value;
     const value = make();
-    if (ttlMs > 0) entries.set(key, { value, at });
+    if (ttlMs > 0) {
+      const entry = { value, at };
+      entries.delete(key);
+      entries.set(key, entry);
+      while (entries.size > MAX_CACHE_ENTRIES) entries.delete(entries.keys().next().value);
+      if (isPromise(value)) {
+        value.then(undefined, () => {
+          if (entries.get(key) === entry) entries.delete(key);
+        });
+      }
+    }
     return value;
   };
 }
@@ -70,7 +91,8 @@ function elapsedSince(t0) {
 /**
  * The default deps, built from factories (the real ones, or stubs in tests). Injected entries win.
  * The store is created on first use; the catalog is cached by its dirs, the index by resolved root,
- * and each cached entry is rebuilt once older than config.cacheTtlMs (0: never cached).
+ * and each cached entry is rebuilt once older than config.cacheTtlMs (0: never cached). A repository
+ * index factory may return a promise (createRepoIndexAsync); the cache then holds the promise.
  * @param {object} config
  * @param {{createMemoryStore: Function, loadCatalog: Function, createRepoIndex: Function}} factories
  * @param {{store?: object, loadCatalog?: Function, repoIndex?: Function}} injected
@@ -100,7 +122,7 @@ async function resolveDeps(config, injected, now) {
   return buildDeps(config, {
     createMemoryStore: store.createMemoryStore,
     loadCatalog: catalog.loadCatalog,
-    createRepoIndex: index.createRepoIndex,
+    createRepoIndex: index.createRepoIndexAsync ?? index.createRepoIndex,
   }, injected, now);
 }
 
@@ -246,7 +268,7 @@ export function createEngine({ config, transport = postDecision, kinds, deps, le
   if (!config) throw new TypeError('createEngine: config is required');
   if (typeof now !== 'function') throw new TypeError('createEngine: now must be a function');
   const ctx = Object.freeze({ config, opts: geminiOptions(config), send: transport });
-  const log = ledger ?? createLedger({ path: config.ledger.path, enabled: config.ledger.enabled });
+  const log = ledger ?? createLedger({ path: config.ledger.path, enabled: config.ledger.enabled, maxBytes: config.ledger.maxBytes });
   const getKinds = kinds ? async () => kinds : loadRegistry;
   const getDeps = once(() => resolveDeps(config, deps ?? {}, now));
   let stats = initialStats();
@@ -284,9 +306,17 @@ export function createEngine({ config, transport = postDecision, kinds, deps, le
       throw err;
     }
     if (!Object.hasOwn(BUCKET_OF_SOURCE, step.source)) throw new Error(`${kind}: invalid source "${step.source}"`);
-    const finished = (await mod.finalize?.(step.verdict, prepared, config, d)) ?? step.verdict;
-    const decision = buildDecision(kind, step, finished, elapsedSince(t0));
-    const summary = mod.summarize(decision.result);
+    let decision;
+    let summary;
+    try {
+      const finished = (await mod.finalize?.(step.verdict, prepared, config, d)) ?? step.verdict;
+      decision = buildDecision(kind, step, finished, elapsedSince(t0));
+      summary = mod.summarize(decision.result);
+    } catch (err) {
+      if (!step.error) stats = countError(stats);
+      log.append(failureDecision(kind, { ...step, error: toError(err) }, elapsedSince(t0)));
+      throw err;
+    }
     stats = countDecision(stats, kind, decision);
     log.append({ ...decision, summary });
     return decision;

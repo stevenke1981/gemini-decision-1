@@ -13,7 +13,7 @@ const KEY = 'sk-proj-SECRETKEYSECRETKEY1234';
 const JWT = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U';
 
 async function withTmp(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-sec-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-sec-'));
   try {
     return await fn(dir);
   } finally {
@@ -159,7 +159,9 @@ const WORKING_FOLDER_ONLY = [
   ['ledger.path', 'ledger.path', { ledger: { path: 'steal.jsonl' } }],
   ['skills.dirs', 'skills.dirs', { skills: { dirs: ['/somewhere'] } }],
   ['retrieve.allowedRoots', 'retrieve.allowedRoots', { retrieve: { allowedRoots: ['/'] } }],
+  ['retrieve.respectGitignore', 'retrieve.respectGitignore', { retrieve: { respectGitignore: false } }],
   ['server.host', 'server.host', { server: { host: '0.0.0.0' } }],
+  ['ledger.enabled', 'ledger.enabled', { ledger: { enabled: false } }],
 ];
 
 for (const [label, key, body] of WORKING_FOLDER_ONLY) {
@@ -277,3 +279,21 @@ test('a config file with a prototype key is refused and pollutes nothing', () =>
   assert.throws(() => loadConfig({ env, cwd }), /"__proto__" is not allowed/);
   assert.equal({}.polluted, undefined);
 }));
+
+test('redact leaves literals and type names as key values alone, but not credentials or quoted values', () => {
+  for (const text of ['auth: true', 'const token: string = input', 'token=None', 'secret: undefined', 'password: NULL', 'apiKey: number', 'pwd = bool']) {
+    assert.equal(redact(text), text, text);
+    assert.equal(SECRET.test(text), false, text);
+  }
+  for (const text of ['password: truely-secret-9', 'password: "true"', "token: 'false'", 'password: nullable1', 'secret: string-value-9']) {
+    assert.ok(redact(text).includes(REDACTED), text);
+  }
+});
+
+test('redact stays fast on long inputs that could backtrack', () => {
+  for (const text of ['a'.repeat(1e6), 'token'.repeat(2e5), 'x_token '.repeat(1e5), 'token: true '.repeat(1e5)]) {
+    const t0 = performance.now();
+    redact(text);
+    assert.ok(performance.now() - t0 < 2000);
+  }
+});

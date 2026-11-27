@@ -10,9 +10,10 @@ import { createEngine, decisionErrorCode } from './engine.js';
 import { DecisionError } from './errors.js';
 import { loadConfig } from './config.js';
 import { MODES } from './defaults.js';
+import { createMemoryStore } from './memory/store.js';
 import { KIND_MODULES } from './registry.js';
 import { VERSION } from './version.js';
-import { scrubSecrets, startHttp } from './server/http.js';
+import { isLoopbackHost, scrubSecrets, startHttp } from './server/http.js';
 import { createMcpServer } from './server/mcp.js';
 
 /** Exit codes: 0 success, 1 a failed command (Gemini, IO, config), 2 a usage or input error. */
@@ -21,7 +22,6 @@ const PROBE_MODE = 'gemini';
 const PROBE_TASK = 'Probe: rename one local variable inside a small helper function.';
 const MAX_PORT = 65535;
 const KEY_VARIABLES = Object.freeze(['GEMINI_API_KEY', 'GOOGLE_API_KEY']);
-const isLoopback = (host) => host === 'localhost' || host === '::1' || host.startsWith('127.');
 const HELP_HINT = 'Run "gemini-core --help" for the commands and options.';
 
 const USAGE = `Usage: gemini-core <command> [options]
@@ -33,6 +33,8 @@ Commands:
   skills --task T              skills to load     [--dir D ...] (repeat --dir for more folders)
   retrieve --query Q           context chunks     [--root R] [--budget N] [--force]
   recall --query Q             stored memories that apply
+  memories                     every stored memory, as a JSON array
+  forget --id ID               delete one stored memory
   remember --text T            save, update or skip a memory   [--source user|agent|tool] [--dry-run]
   compress --file FILE         compact a transcript; FILE holds the input object as JSON
   serve [--port N]             HTTP sidecar on 127.0.0.1 (default port 8792)
@@ -69,6 +71,8 @@ const COMMANDS = Object.freeze({
   skills: { options: { task: str, dir: multi }, run: runSkills },
   retrieve: { options: { query: str, root: str, budget: str, force: flag }, run: runRetrieve },
   recall: { options: { query: str }, run: runRecall },
+  memories: { options: {}, run: runMemories },
+  forget: { options: { id: str }, run: runForget },
   remember: { options: { text: str, source: str, 'dry-run': flag }, run: runRemember },
   compress: { options: { file: str }, run: runCompress },
   serve: { options: { port: str }, run: runServe },
@@ -227,8 +231,12 @@ async function runRoute({ values, io }) {
 
 async function runSkills({ values, io }) {
   const input = { task: requireOption(values, 'task') };
-  if (values.dir !== undefined) input.dirs = values.dir.map((dir) => resolveIn(io.cwd, dir));
-  return decideAndPrint(io, configFor(io, values), 'skills', input);
+  if (values.dir === undefined) return decideAndPrint(io, configFor(io, values), 'skills', input);
+  input.dirs = values.dir.map((dir) => resolveIn(io.cwd, dir));
+  // The CLI user is trusted: the folders named on the command line join the allowed skills folders.
+  const loaded = configFor(io, values);
+  const dirs = [...new Set([...loaded.skills.dirs, ...input.dirs])];
+  return decideAndPrint(io, configFor(io, values, { skills: { dirs } }), 'skills', input);
 }
 
 async function runRetrieve({ values, io }) {
@@ -250,6 +258,22 @@ async function runRemember({ values, io }) {
   if (values.source !== undefined) input.source = values.source;
   if (values['dry-run']) input.dryRun = true;
   return decideAndPrint(io, configFor(io, values), 'memory_write', input);
+}
+
+/** Prints every stored memory as a JSON array. */
+async function runMemories({ values, io }) {
+  const config = configFor(io, values);
+  writeJson(io.stdout, createMemoryStore(config.memory.path).list());
+  return EXIT.OK;
+}
+
+/** Deletes the memory with the given id; an unknown id is an error (exit 1). */
+async function runForget({ values, io }) {
+  const id = requireOption(values, 'id');
+  const config = configFor(io, values);
+  if (!createMemoryStore(config.memory.path).remove(id)) throw new Error(`no memory has id "${id}"`);
+  writeJson(io.stdout, { removed: true, id });
+  return EXIT.OK;
 }
 
 /** The JSON object in a file. A file that cannot be read is an error; one that is not JSON is usage. */
@@ -288,7 +312,7 @@ function untilStopped(server, signal) {
 function announce(io, config, server) {
   const { address, port } = server.address();
   const host = address.includes(':') ? `[${address}]` : address;
-  if (!isLoopback(config.server.host)) {
+  if (!isLoopbackHost(config.server.host)) {
     io.stderr.write(`gemini-core: warning: ${config.server.host} is not loopback; anyone who can reach it can use this server and its Gemini key\n`);
   }
   io.stderr.write(`gemini-core: serving http://${host}:${port} (mode ${config.mode}); stop with Ctrl+C\n`);

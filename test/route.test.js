@@ -272,6 +272,50 @@ test('heuristic: the same failing command twice in the last six steps counts as 
   assert.deepEqual(pick(route.heuristic(route.normalize({ task: PLAIN, steps: edge }, cfg), cfg).result), ['max', OPUS]);
 });
 
+const FULL_LADDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+const SECURITY_TASK = 'Redesign the architecture to fix a security race condition';
+const ROUTINE_TASK = 'Add a unit test for the parser';
+
+test('heuristic on the full 7-entry ladder aims at effort names, not ladder indexes', () => {
+  const full = makeCfg({ ladder: FULL_LADDER });
+  const run = (task, steps) => route.heuristic(route.normalize({ task, steps }, full), full).result;
+  assert.deepEqual(pick(run(SECURITY_TASK)), ['high', SONNET]);
+  assert.deepEqual(pick(run(ROUTINE_TASK)), ['medium', HAIKU]);
+  assert.deepEqual(pick(run('hello')), ['low', HAIKU]);
+  assert.deepEqual(pick(run(ROUTINE_TASK, [failed('a'), failed('b')])), ['high', SONNET]);
+  assert.deepEqual(pick(run(ROUTINE_TASK, [failed('a'), failed('b'), failed('c')])), ['max', OPUS]);
+});
+
+test('heuristic on the ladder [low, high] maps each target to the nearest entry, ties down unless failing', () => {
+  const short = makeCfg({ ladder: ['low', 'high'] });
+  const run = (task, steps) => route.heuristic(route.normalize({ task, steps }, short), short);
+  assert.deepEqual(pick(run('hello').result), ['low', HAIKU]);
+  const routine = run(ROUTINE_TASK);
+  assert.deepEqual(pick(routine.result), ['low', HAIKU], 'medium is equally far from low and high: down');
+  assert.ok(routine.reasons.includes('target effort medium mapped to low on the ladder'));
+  assert.deepEqual(pick(run(SECURITY_TASK).result), ['high', SONNET]);
+  assert.deepEqual(pick(run(ROUTINE_TASK, [failed('npm test')]).result), ['high', HAIKU], 'in a failure streak a tie goes up');
+  assert.deepEqual(pick(run(ROUTINE_TASK, [failed('a'), failed('b'), failed('c')]).result), ['high', OPUS], 'stuck: top of the ladder');
+});
+
+test('heuristic picks the model by target effort, so a high-only ladder does not send a greeting to the top model', () => {
+  const highOnly = makeCfg({ ladder: ['xhigh', 'max'] });
+  const run = (task) => route.heuristic(route.normalize({ task }, highOnly), highOnly).result;
+  assert.deepEqual(pick(run('hello')), ['xhigh', HAIKU]);
+  assert.deepEqual(pick(run(SECURITY_TASK)), ['xhigh', SONNET]);
+});
+
+test('gate uses the ladder-mapped rules effort as its floor on a non-default ladder', () => {
+  const short = makeCfg({ ladder: ['low', 'high'] });
+  const input = route.normalize({ task: ROUTINE_TASK, steps: [failed('npm test')] }, short);
+  const p = route.plan(input, short);
+  const gemini = route.interpret(answersFor({ model: HAIKU_FIRST, effort: [1, 0] }), p.ctx, short);
+  assert.deepEqual(pick(gemini.result), ['low', HAIKU]);
+  const g = route.gate(gemini, route.heuristic(input, short), input, short);
+  assert.equal(g.source, 'gemini+rules');
+  assert.deepEqual(pick(g.result), ['high', HAIKU]);
+});
+
 test('gate raises a Gemini answer to the rules model and effort after a failure (gemini+rules)', () => {
   const input = route.normalize({ task: HARD, steps: [failed('npm test')] }, cfg);
   const p = route.plan(input, cfg);

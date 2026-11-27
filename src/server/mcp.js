@@ -17,6 +17,8 @@ export const SERVER_NAME = 'gemini-decision-1';
 const CODE = Object.freeze({ PARSE: -32700, INVALID_REQUEST: -32600, METHOD_NOT_FOUND: -32601, INVALID_PARAMS: -32602, INTERNAL: -32603 });
 const STEP_KINDS = ['read', 'edit', 'verify', 'exec', 'tool'];
 const SOURCES = ['user', 'agent', 'tool'];
+const READ_ONLY = Object.freeze({ readOnlyHint: true });
+const WRITES_MEMORY = Object.freeze({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
 const writeStderr = (line) => process.stderr.write(line);
 
 const str = (description) => ({ type: 'string', description });
@@ -67,6 +69,7 @@ const SEGMENT = closed({
 const TOOLS = Object.freeze([
   {
     name: 'gemini_route',
+    annotations: READ_ONLY,
     kind: 'route',
     description: 'Choose the model and reasoning effort for the next generation of a coding task.',
     inputSchema: closed({
@@ -82,6 +85,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'gemini_skills',
+    annotations: READ_ONLY,
     kind: 'skills',
     description: 'Choose which skills (SKILL.md packages) to load for a task.',
     inputSchema: closed({
@@ -93,6 +97,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'gemini_retrieve',
+    annotations: READ_ONLY,
     kind: 'retrieve',
     description: 'Decide whether a query needs repository or memory context, and which chunks are relevant.',
     inputSchema: closed({
@@ -105,6 +110,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'gemini_recall',
+    annotations: READ_ONLY,
     kind: 'memory_recall',
     description: 'Pick the stored memories that apply to a query.',
     inputSchema: closed({
@@ -114,6 +120,8 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'gemini_remember',
+    // An update replaces the stored text of the similar memory.
+    annotations: WRITES_MEMORY,
     kind: 'memory_write',
     description: 'Decide whether an observation is saved as a new memory, used to update a similar one, or skipped.',
     inputSchema: closed({
@@ -125,6 +133,7 @@ const TOOLS = Object.freeze([
   },
   {
     name: 'gemini_compress',
+    annotations: READ_ONLY,
     kind: 'compress',
     description: 'Decide whether to compact a context window now, and keep, summarize or drop each old segment.',
     inputSchema: closed({
@@ -215,7 +224,7 @@ async function dispatch(method, params, ctx) {
     case 'ping':
       return {};
     case 'tools/list':
-      return { tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) };
+      return { tools: TOOLS.map(({ name, description, inputSchema, annotations }) => ({ name, description, inputSchema, annotations })) };
     case 'tools/call':
       return callTool(params, ctx);
     default:

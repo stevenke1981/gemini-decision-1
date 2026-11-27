@@ -44,7 +44,7 @@ function capture() {
 }
 
 function fixture() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-cli-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-cli-'));
   return {
     dir,
     write(rel, text) {
@@ -467,6 +467,60 @@ test('mcp answers JSON-RPC over stdin and writes nothing but JSON-RPC lines to s
     assert.equal(reply.id, 1);
     assert.equal(reply.result.serverInfo.name, 'gemini-decision-1');
     assert.equal(stderr.text, '');
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('skills --dir accepts a folder outside the working folder, since the CLI user is trusted', async () => {
+  const f = fixture();
+  const outside = fixture();
+  try {
+    outside.write('rust-testing/SKILL.md', '---\nname: rust-testing\ndescription: Write Rust unit tests\n---\n');
+    const r = await run(f, ['skills', '--task', 'use rust-testing for the parser', '--dir', outside.dir, '--mode', 'heuristic']);
+    assert.equal(r.code, EXIT.OK, r.err);
+    assert.equal(r.json().result.selected[0].name, 'rust-testing');
+  } finally {
+    f.cleanup();
+    outside.cleanup();
+  }
+});
+
+test('memories prints every stored memory as a JSON array, and forget removes one by id', async () => {
+  const f = fixture();
+  try {
+    const empty = await run(f, ['memories']);
+    assert.equal(empty.code, EXIT.OK, empty.err);
+    assert.deepEqual(empty.json(), []);
+
+    const saved = await run(f, ['remember', '--text', 'Remember: I prefer pnpm over npm', '--source', 'user', '--mode', 'heuristic']);
+    assert.equal(saved.code, EXIT.OK, saved.err);
+    const listed = await run(f, ['memories']);
+    assert.equal(listed.json().length, 1);
+    const { id } = listed.json()[0];
+
+    const gone = await run(f, ['forget', '--id', id]);
+    assert.equal(gone.code, EXIT.OK, gone.err);
+    assert.deepEqual(gone.json(), { removed: true, id });
+    assert.deepEqual((await run(f, ['memories'])).json(), []);
+
+    const again = await run(f, ['forget', '--id', id]);
+    assert.equal(again.code, EXIT.ERROR);
+    assert.match(again.err, /no memory has id/);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test('forget without --id is a usage error, and the usage text lists both new commands', async () => {
+  const f = fixture();
+  try {
+    const r = await run(f, ['forget']);
+    assert.equal(r.code, EXIT.USAGE);
+    assert.match(r.err, /missing required --id/);
+    const help = await run(f, ['--help']);
+    assert.match(help.out, /memories /);
+    assert.match(help.out, /forget --id ID/);
   } finally {
     f.cleanup();
   }

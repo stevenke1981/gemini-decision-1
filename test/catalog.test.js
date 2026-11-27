@@ -6,7 +6,7 @@ import path from 'node:path';
 import { loadCatalog, parseFrontMatter } from '../src/skills/catalog.js';
 
 function withTmp(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-catalog-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-catalog-'));
   try {
     return fn(dir);
   } finally {

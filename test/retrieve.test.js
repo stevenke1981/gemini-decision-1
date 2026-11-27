@@ -14,7 +14,7 @@ import { fakeGemini, predicate } from './helpers/fakeGemini.js';
 const { normalize, prepare, plan, interpret, heuristic, summarize } = retrieve;
 
 async function withDir(fn) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-retrieve-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-retrieve-'));
   try {
     return await fn(dir);
   } finally {
@@ -132,7 +132,7 @@ test('with no allowedRoots a root must lie in the working folder the config was 
 
 test('a root that is a link to a folder outside the allowed ones is refused before indexing', () => withDir(async (dir) => {
   const inside = path.join(dir, 'inside');
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-out-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-out-'));
   try {
     fs.mkdirSync(inside);
     fs.writeFileSync(path.join(outside, 'secret.js'), 'export const hidden = 1;\n');
@@ -180,7 +180,7 @@ test('plan settles without a Gemini call when there are no candidates', () => wi
   const p = plan(normalize({ query: 'where is the cache' }, cfg), cfg);
   assert.equal(p.questions, undefined);
   assert.deepEqual(p.settled, {
-    result: { needed: false, chunks: [], tokens: 0, considered: 0 },
+    result: { needed: false, chunks: [], tokens: 0, considered: 0, truncated: false, skipped: 0 },
     confidence: null,
     reasons: ['no candidates'],
   });
@@ -221,7 +221,7 @@ test('interpret: not needed gives no chunks, and the certainty of the need answe
   const candidates = [cand('src/a.js#1', 'alpha'), cand('src/b.js#1', 'beta')];
   const p = plan(normalize({ query: 'what does this do', candidates }, cfg), cfg);
   const v = interpret(answersOf(predicate('need_retrieval', 0.2), predicate('c0', 0.9), predicate('c1', 0.9)), p.ctx, cfg);
-  assert.deepEqual(v.result, { needed: false, chunks: [], tokens: 0, considered: 2 });
+  assert.deepEqual(v.result, { needed: false, chunks: [], tokens: 0, considered: 2, truncated: false, skipped: 0 });
   near(v.confidence, 0.8);
   assert.deepEqual(v.reasons, ['gemini: no retrieval needed']);
 }));
@@ -319,7 +319,7 @@ test('heuristic and interpret return the same result shape', () => withDir(async
   const rules = heuristic(normalize({ query: 'alpha beta gamma', candidates }, cfg));
   const gemini = interpret(answersOf(predicate('need_retrieval', 0.9), predicate('c0', 0.9)), plan(normalize({ query: 'alpha beta gamma', candidates }, cfg), cfg).ctx, cfg);
   for (const v of [rules, gemini]) {
-    assert.deepEqual(Object.keys(v.result).sort(), ['chunks', 'considered', 'needed', 'tokens']);
+    assert.deepEqual(Object.keys(v.result).sort(), ['chunks', 'considered', 'needed', 'skipped', 'tokens', 'truncated']);
     assert.deepEqual(Object.keys(v.result.chunks[0]).sort(), ['endLine', 'id', 'probability', 'source', 'startLine', 'text']);
   }
   assert.equal(rules.result.chunks[0].probability, null);
@@ -372,3 +372,54 @@ test('end to end: the repository index, Gemini through the fake transport, then 
   assert.ok(v.result.chunks.some((c) => c.source === 'src/cache.js' && c.text.includes('evict')));
   assert.ok(fake.calls[0].state.chunks.every((c) => !path.isAbsolute(c.source.split(':')[0])));
 }));
+
+// ------------------------------------------------ index completeness
+
+/** A repoIndex double whose index reports the given completeness and one hit. */
+const partialDeps = (extra) => ({
+  repoIndex: () => ({ search: () => [cand('src/x.js#1', 'cache eviction', { score: 2 })], ...extra }),
+});
+
+test('prepare carries truncated and skipped from the index, and false and 0 when the double has none or candidates are given', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const repo = path.join(dir, 'repo');
+  const cut = await prepare(normalize({ query: 'cache eviction', root: repo }, cfg), cfg, partialDeps({ truncated: true, skipped: 3 }));
+  assert.deepEqual([cut.truncated, cut.skipped], [true, 3]);
+  const plain = await prepare(normalize({ query: 'cache eviction', root: repo }, cfg), cfg, partialDeps({}));
+  assert.deepEqual([plain.truncated, plain.skipped], [false, 0]);
+  const given = await prepare(normalize({ query: 'q', root: repo, candidates: [] }, cfg), cfg, partialDeps({ truncated: true, skipped: 3 }));
+  assert.deepEqual([given.truncated, given.skipped], [false, 0]);
+  const noRoot = await prepare(normalize({ query: 'q' }, cfg), cfg, partialDeps({ truncated: true, skipped: 3 }));
+  assert.deepEqual([noRoot.truncated, noRoot.skipped], [false, 0]);
+}));
+
+test('a truncated index is reported on the settled, rules and Gemini paths, with a reason', () => withDir(async (dir) => {
+  const cfg = cfgFor(dir, { allowedRoots: [dir] });
+  const repo = path.join(dir, 'repo');
+  const input = await prepare(normalize({ query: 'cache eviction policy', root: repo }, cfg), cfg, partialDeps({ truncated: true, skipped: 2 }));
+  const rules = heuristic(input);
+  assert.deepEqual([rules.result.truncated, rules.result.skipped], [true, 2]);
+  assert.ok(rules.reasons.some((r) => /truncated.*incomplete/.test(r)));
+  const notNeeded = heuristic({ ...input, query: 'hi' });
+  assert.ok(notNeeded.result.truncated && notNeeded.reasons.some((r) => /truncated/.test(r)));
+  const p = plan(input, cfg);
+  const gemini = interpret(answersOf(predicate('need_retrieval', 0.9), predicate('c0', 0.9)), p.ctx, cfg);
+  assert.deepEqual([gemini.result.truncated, gemini.result.skipped], [true, 2]);
+  assert.ok(gemini.reasons.some((r) => /truncated.*incomplete/.test(r)));
+  const forced = plan({ ...input, force: true }, cfg);
+  const forcedV = interpret(answersOf(predicate('c0', 0.9)), forced.ctx, cfg);
+  assert.ok(forcedV.result.truncated && forcedV.reasons.some((r) => /truncated/.test(r)));
+  const settled = plan({ ...input, candidates: [] }, cfg).settled;
+  assert.deepEqual([settled.result.truncated, settled.result.skipped], [true, 2]);
+  assert.ok(settled.reasons.some((r) => /truncated/.test(r)));
+  const complete = heuristic(await prepare(normalize({ query: 'cache eviction policy', root: repo }, cfg), cfg, partialDeps({})));
+  assert.deepEqual([complete.result.truncated, complete.result.skipped], [false, 0]);
+  assert.ok(!complete.reasons.some((r) => /truncated/.test(r)));
+}));
+
+test('summarize mentions a truncated index and still holds no query or chunk text', () => {
+  const result = { needed: true, chunks: [{ text: 'PRIVATE-XYZ' }], tokens: 12, considered: 5, truncated: true, skipped: 1 };
+  assert.equal(summarize(result), '1 of 5 chunks, 12 tokens; index truncated');
+  assert.equal(summarize({ ...result, needed: false, chunks: [] }), 'not needed; 5 considered; index truncated');
+  assert.ok(!summarize(result).includes('XYZ'));
+});

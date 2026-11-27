@@ -1,13 +1,17 @@
 // The memory store (docs/design.md §4.4): one JSON record per line of a JSONL file. Every call
 // re-reads the file, so another store or process on the same file always sees the latest
 // records. Writes go to a temp file in the same folder that is renamed over the file, so a crash
-// never leaves a half-written store. A line that cannot be read is skipped and reported in
-// `warnings`; the next write keeps only the valid records, and appends the skipped lines to
-// `<file>.rejected` first. A text that looks like a secret (contract SECRET) is refused on the way
-// in and skipped on the way out, and a skipped line that holds one keeps no text in `.rejected`.
+// never leaves a half-written store; the temp file is flushed to disk (fsync) before the rename, so
+// a power loss does not leave an empty or truncated store either. A line that cannot be read is
+// skipped and reported in `warnings`; the next write keeps only the valid records, and appends the
+// skipped lines to `<file>.rejected` first. A text that looks like a secret (contract SECRET) is
+// refused on the way in and skipped on the way out, and a skipped line that holds one keeps no text
+// in `.rejected`. Before `update` or `remove` rewrites the file, the record as it was is appended
+// to `<file>.history` as `{ at, op, record }`; the history is append-only and never read back.
 // Every read-modify-write holds `<file>.lock` (created exclusively), so several processes on one
 // store do not lose each other's records. A lock older than LOCK_STALE_MS is taken to be left by a
-// dead process and is removed.
+// dead process and is removed. The lock file holds a token of its holder, and a holder removes the
+// lock only while it still holds that token. Every file the store creates has mode 0o600.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -23,6 +27,9 @@ const SECRET_REFUSAL = 'memory: refusing to store a text that looks like a secre
 const STRING_FIELDS = ['source', 'created', 'updated'];
 const LOCK_SUFFIX = '.lock';
 const REJECTED_SUFFIX = '.rejected';
+const HISTORY_SUFFIX = '.history';
+const PRIVATE_MODE = 0o600; // owner only; not enforced on Windows
+const TOKEN_BYTES = 8;
 const LOCK_WAIT_MS = 2000;
 const LOCK_STALE_MS = 10000;
 const LOCK_RETRY_MS = 10;
@@ -155,17 +162,33 @@ function statOrNull(p) {
   }
 }
 
+/** Writes the holder's token into the new lock file; on failure the lock is closed and removed. */
+function writeToken(fd, lockPath, token) {
+  try {
+    fs.writeFileSync(fd, token, 'utf8');
+  } catch (err) {
+    fs.closeSync(fd);
+    fs.rmSync(lockPath, { force: true });
+    throw err;
+  }
+}
+
 /**
- * Creates the lock file exclusively. Returns `{ fd }`, or `{ busy: code }` while another holder
- * has the lock (EEXIST) or Windows still refuses the name (a lock being deleted: EPERM).
+ * Creates the lock file exclusively, with a fresh token written into it. Returns `{ fd, token }`,
+ * or `{ busy: code }` while another holder has the lock (EEXIST) or Windows still refuses the name
+ * (a lock being deleted: EPERM).
  */
 function tryCreateLock(lockPath) {
+  let fd;
   try {
-    return { fd: fs.openSync(lockPath, 'wx') };
+    fd = fs.openSync(lockPath, 'wx', PRIVATE_MODE);
   } catch (err) {
     if (err.code === 'EEXIST' || BUSY_CODES.includes(err.code)) return { busy: err.code };
     throw new Error(`memory: cannot create lock ${lockPath}: ${err.message}`);
   }
+  const token = `${process.pid}.${crypto.randomBytes(TOKEN_BYTES).toString('hex')}`;
+  writeToken(fd, lockPath, token);
+  return { fd, token };
 }
 
 /**
@@ -188,7 +211,7 @@ function acquireLock(file) {
   const deadline = Date.now() + LOCK_WAIT_MS;
   for (;;) {
     const attempt = tryCreateLock(lockPath);
-    if (attempt.fd !== undefined) return { fd: attempt.fd, lockPath };
+    if (attempt.fd !== undefined) return { fd: attempt.fd, lockPath, token: attempt.token };
     removeIfStale(lockPath);
     if (Date.now() >= deadline) {
       throw new Error(`memory: ${file} is locked by another process or refused (waited ${LOCK_WAIT_MS} ms; last refusal ${attempt.busy})`);
@@ -197,12 +220,24 @@ function acquireLock(file) {
   }
 }
 
-/** Closes and removes the lock file, even when closing fails. */
-function releaseLock({ fd, lockPath }) {
+/** Removes the lock file only while it still holds `token`; a missing file or another token is left alone. */
+function removeIfOwned(lockPath, token) {
+  let held;
+  try {
+    held = fs.readFileSync(lockPath, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return;
+    throw err;
+  }
+  if (held === token) fs.rmSync(lockPath, { force: true });
+}
+
+/** Closes the lock file and removes it if it is still ours, even when closing fails. */
+function releaseLock({ fd, lockPath, token }) {
   try {
     fs.closeSync(fd);
   } finally {
-    retryBusy(() => fs.rmSync(lockPath, { force: true }));
+    retryBusy(() => removeIfOwned(lockPath, token));
   }
 }
 
@@ -225,12 +260,20 @@ function rejectedEntries(skipped, at) {
 function appendRejected(file, skipped, at) {
   if (skipped.length === 0) return;
   const body = rejectedEntries(skipped, at).map((entry) => `${JSON.stringify(entry)}\n`).join('');
-  fs.appendFileSync(`${file}${REJECTED_SUFFIX}`, body, 'utf8');
+  fs.appendFileSync(`${file}${REJECTED_SUFFIX}`, body, { encoding: 'utf8', mode: PRIVATE_MODE });
+}
+
+/** Appends `{ at, op, record }` per replaced or removed record to `<file>.history`; none: no file touched. */
+function appendHistory(file, history, at) {
+  if (history.length === 0) return;
+  const body = history.map(({ op, record }) => `${JSON.stringify({ at, op, record })}\n`).join('');
+  fs.appendFileSync(`${file}${HISTORY_SUFFIX}`, body, { encoding: 'utf8', mode: PRIVATE_MODE });
 }
 
 /**
  * A read-modify-write under the lock. `change(records)` returns `{ records, result }`: `records` is
- * the list to write, or null to leave the file alone. Skipped lines are kept in `.rejected` first.
+ * the list to write, or null to leave the file alone; `history` (optional) lists the `{ op, record }`
+ * of the records it replaces or removes. Skipped lines go to `.rejected` and history to `.history` first.
  */
 function mutate(file, stamp, change) {
   return withLock(file, () => {
@@ -238,21 +281,35 @@ function mutate(file, stamp, change) {
     const next = change(records);
     if (next.records) {
       appendRejected(file, skipped, stamp());
+      appendHistory(file, next.history ?? [], stamp());
       writeRecords(file, next.records);
     }
     return next.result;
   });
 }
 
-/** Writes the records to a temp file beside `file`, then renames it over `file`. Call under the lock. */
+/**
+ * Writes the records to a temp file beside `file`, flushes it to disk, then renames it over `file`.
+ * Call under the lock.
+ */
 function writeRecords(file, records) {
   const dir = path.dirname(file);
   const tmp = path.join(dir, `.${path.basename(file)}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   const body = records.map((r) => `${JSON.stringify(r)}\n`).join('');
+  let fd;
   try {
-    fs.writeFileSync(tmp, body, 'utf8');
+    fd = fs.openSync(tmp, 'wx', PRIVATE_MODE);
+    fs.writeFileSync(fd, body, 'utf8');
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
     retryBusy(() => fs.renameSync(tmp, file));
   } catch (err) {
+    try {
+      if (fd !== undefined) fs.closeSync(fd);
+    } catch {
+      // the original error is the one to report
+    }
     try {
       fs.rmSync(tmp, { force: true });
     } catch (cleanupErr) {
@@ -330,14 +387,16 @@ export function createMemoryStore(file, { now = () => new Date() } = {}) {
         const index = records.findIndex((r) => r.id === id);
         if (index < 0) throw new Error(`memory: unknown id "${id}"`);
         const next = { ...records[index], ...changes, updated: stamp() };
-        return { records: records.map((r, i) => (i === index ? next : r)), result: copy(next) };
+        const history = [{ op: 'update', record: copy(records[index]) }];
+        return { records: records.map((r, i) => (i === index ? next : r)), result: copy(next), history };
       });
     },
     /** Removes a record; false when no record has this id (the file is then left alone). */
     remove(id) {
       return mutate(file, stamp, (records) => {
         if (!records.some((r) => r.id === id)) return { records: null, result: false };
-        return { records: records.filter((r) => r.id !== id), result: true };
+        const history = [{ op: 'remove', record: copy(records.find((r) => r.id === id)) }];
+        return { records: records.filter((r) => r.id !== id), result: true, history };
       });
     },
   });

@@ -452,3 +452,126 @@ test('auto mode propagates gate programming errors without returning a fallback'
   assert.equal(engine.stats().fallbacks, 0);
   assert.equal(readLedger(home)[0].errorCode, 'INTERNAL_ERROR');
 }));
+
+test('the cache drops expired entries whenever it is used and keeps at most a few entries', () => withHome(async (home) => {
+  let clock = 0;
+  const made = [];
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: () => [],
+    createRepoIndex: (root) => { made.push(root); return { root }; },
+  };
+  const deps = buildDeps(configFor(home, { cacheTtlMs: 100 }), factories, {}, () => clock);
+  const roots = Array.from({ length: 20 }, (_, i) => path.join(home, `r${i}`));
+  for (const r of roots) deps.repoIndex(r);
+  assert.equal(made.length, 20);
+  deps.repoIndex(roots[19]);
+  assert.equal(made.length, 20, 'the newest entry is still cached');
+  deps.repoIndex(roots[0]);
+  assert.equal(made.length, 21, 'the oldest entry was evicted by the cap');
+  // An expired entry is dropped when another key is used, not only when it is asked for again.
+  clock = 1000;
+  deps.repoIndex(roots[5]);
+  deps.repoIndex(roots[19]);
+  assert.equal(made.length, 23, 'every expired entry was dropped, so both are built again');
+  deps.repoIndex(roots[19]);
+  assert.equal(made.length, 23);
+}));
+
+test('a failure in finalize after Gemini was paid for is logged with the spend, counted once, and rethrown unchanged', () => withHome(async (home) => {
+  const boom = new Error('memory store is locked');
+  const kinds = { alpha: stub('alpha', { finalize: () => { throw boom; } }) };
+  const fake = fakeGemini({ predicates: { ok: 0.9 } });
+  const engine = createEngine({ config: configFor(home), kinds, deps: DEPS, transport: fake.transport });
+  await assert.rejects(() => engine.decide('alpha', { task: 't' }), (err) => err === boom);
+  const [entry] = readLedger(home);
+  assert.equal(entry.kind, 'alpha');
+  assert.equal(entry.error, 'memory store is locked');
+  assert.ok(entry.result == null);
+  assert.ok(entry.calls >= 1);
+  const stats = engine.stats();
+  assert.equal(stats.errors, 1);
+  assert.equal(stats.decisions, 0);
+  assert.equal(stats.geminiCalls, entry.calls);
+}));
+
+test('a failure in summarize is recorded the same way', () => withHome(async (home) => {
+  const boom = new Error('summary broke');
+  const kinds = { alpha: stub('alpha', { summarize: () => { throw boom; } }) };
+  const engine = createEngine({ config: configFor(home, { mode: 'heuristic' }), kinds, deps: DEPS });
+  await assert.rejects(() => engine.decide('alpha', { task: 't' }), (err) => err === boom);
+  assert.equal(readLedger(home).length, 1);
+  assert.equal(engine.stats().errors, 1);
+}));
+
+test('concurrent index requests for one root share one build', () => withHome(async (home) => {
+  let builds = 0;
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: () => [],
+    createRepoIndex: async (root) => { builds++; await new Promise((r) => setTimeout(r, 10)); return { root }; },
+  };
+  const deps = buildDeps(configFor(home), factories, {});
+  const [a, b, c] = await Promise.all([deps.repoIndex(home), deps.repoIndex(home), deps.repoIndex(path.join(home, 'x', '..'))]);
+  assert.equal(builds, 1);
+  assert.equal(a, b);
+  assert.equal(a, c);
+  assert.equal(await deps.repoIndex(home), a, 'a settled build stays cached');
+  assert.equal(builds, 1);
+}));
+
+test('an index build that rejects is not cached: the next request builds again', () => withHome(async (home) => {
+  let builds = 0;
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: () => [],
+    createRepoIndex: async (root) => {
+      builds++;
+      if (builds === 1) throw new Error('walk failed');
+      return { root };
+    },
+  };
+  const deps = buildDeps(configFor(home), factories, {});
+  await assert.rejects(deps.repoIndex(home), /walk failed/);
+  assert.deepEqual(await deps.repoIndex(home), { root: home });
+  assert.equal(builds, 2);
+  await deps.repoIndex(home);
+  assert.equal(builds, 2, 'the good build is cached');
+}));
+
+test('a rejected build does not evict a newer entry for the same root', () => withHome(async (home) => {
+  let clock = 0;
+  let rejectFirst;
+  let builds = 0;
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: () => [],
+    createRepoIndex: (root) => {
+      builds++;
+      if (builds === 1) return new Promise((_, reject) => { rejectFirst = reject; });
+      return Promise.resolve({ root, build: builds });
+    },
+  };
+  const deps = buildDeps(configFor(home, { cacheTtlMs: 100 }), factories, {}, () => clock);
+  const first = deps.repoIndex(home);
+  first.catch(() => {});
+  clock = 200;
+  const second = await deps.repoIndex(home);
+  rejectFirst(new Error('late failure'));
+  await assert.rejects(first, /late failure/);
+  assert.equal(await deps.repoIndex(home), second, 'the newer entry is still cached');
+  assert.equal(builds, 2);
+}));
+
+test('a synchronous index factory still works through the cache', () => withHome(async (home) => {
+  let builds = 0;
+  const factories = {
+    createMemoryStore: () => ({}),
+    loadCatalog: () => [],
+    createRepoIndex: (root) => { builds++; return { root }; },
+  };
+  const deps = buildDeps(configFor(home), factories, {});
+  assert.deepEqual(deps.repoIndex(home), { root: home });
+  assert.equal(deps.repoIndex(home), deps.repoIndex(home));
+  assert.equal(builds, 1);
+}));

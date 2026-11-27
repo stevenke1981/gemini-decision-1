@@ -20,7 +20,7 @@ const METHOD_NOT_FOUND = -32601;
 const INVALID_PARAMS = -32602;
 
 function home(overrides = {}, env = {}) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lcore-mcp-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gcore-mcp-'));
   const config = loadConfig({ env: { GEMINI_CORE_HOME: dir, ...env }, cwd: dir, overrides: { mode: 'heuristic', ...overrides } });
   return { dir, config, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) };
 }
@@ -124,7 +124,7 @@ test('tools/call answers every other tool in heuristic mode', async () => {
   try {
     const engine = createEngine({ config: h.config });
     // Requests run concurrently, so the recall waits for the write it depends on.
-    const written = await exchange(engine, [call(3, 'gemini_remember', { observation: 'Remember: I prefer pnpm over npm', source: 'agent' })]);
+    const written = await exchange(engine, [call(3, 'gemini_remember', { observation: 'Remember: I prefer pnpm over npm', source: 'user' })]);
     assert.equal(JSON.parse(written.replies[0].result.content[0].text).result.applied, true);
     const { replies } = await exchange(engine, [
       call(1, 'gemini_skills', { task: 'use rust-testing', catalog: [{ name: 'rust-testing', description: 'Rust tests' }] }),
@@ -310,4 +310,17 @@ test('a tool error message has the API key scrubbed when the config supplies it'
 
 test('createMcpServer requires an engine', () => {
   assert.throws(() => createMcpServer({}), /engine is required/);
+});
+
+test('tools/list annotates every tool: five are read only, gemini_remember writes and may replace', async () => {
+  const h = home();
+  try {
+    const { replies } = await exchange(createEngine({ config: h.config }), [request(1, 'tools/list')]);
+    const byName = Object.fromEntries(replies[0].result.tools.map((t) => [t.name, t.annotations]));
+    for (const name of TOOL_NAMES.filter((n) => n !== 'gemini_remember')) assert.deepEqual(byName[name], { readOnlyHint: true }, name);
+    assert.deepEqual(byName.gemini_remember, { readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+    assert.equal(PROTOCOL_VERSION, '2025-06-18');
+  } finally {
+    h.cleanup();
+  }
 });

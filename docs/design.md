@@ -156,7 +156,9 @@ Input: `{ query, root?: string, candidates?: Chunk[], budgetTokens?, force?: boo
 deps.repoIndex(root).search(query, cfg.retrieve.shortlist) : []`. `root` is resolved to an
 absolute path and must lie in `retrieve.allowedRoots` (empty: under `cfg.cwd`, the folder the
 config was loaded for); before indexing, its real path (links resolved) must lie there too. Gemini
-sees at most `shortlist` candidates, best score first.
+sees at most `shortlist` candidates, best score first. Every result carries `truncated` and
+`skipped` from the repository index (`false` and `0` when the caller supplied the candidates), so
+an index cut short by `maxWalkMs` or `maxFiles` is visible; a truncated index adds a reason line.
 
 Index: `chunkFile(relPath, text, {chunkLines, chunkOverlap}) → Chunk[]` (line windows, ids
 `relPath#startLine`, 1-based inclusive lines, posix paths). `createRepoIndex(root, rcfg)` walks
@@ -199,7 +201,7 @@ to `<file>.rejected` (no raw text for secret lines), and **refuse** a text match
 recognize paraphrases. Heuristic recall keeps only positive lexical matches. None → settled
 `{memories: [], considered: 0}`. State `{ query, memories:
 [{id: m<i>, type, text: excerpt 400}] }`; predicate per memory. Result `{ memories: [{id, type,
-text, probability|null}], considered }`, p ≥ recallThreshold by p desc, capped at limit ??
+text, source, probability|null}], considered }`, p ≥ recallThreshold by p desc, capped at limit ??
 maxRecall. Heuristic: BM25 score ≥ 0.5 × top, capped.
 
 `memory_write` input `{ observation, source?: 'user'|'agent'|'tool' (default 'user'), type?,
@@ -213,7 +215,8 @@ similar. Interpret: durable < durableThreshold → `skip`; `update` with one sim
 Result `{ action: 'save_new'|'update'|'skip', type, targetId|null, text, applied: false,
 memory: null }`; confidence = action confidence.
 
-Heuristic: secret → skip; best similarity ≥ duplicateSimilarity → `update` that one (skip if ≥
+Heuristic: secret → skip; a `source` other than `user` → skip (the rules never store what a tool
+or the agent said, so tool output cannot become a standing instruction); best similarity ≥ duplicateSimilarity → `update` that one (skip if ≥
 0.95); else save when `REMEMBER` (remember, always, never, prefer, don't, from now on, 記住,
 以後, 總是, 不要, 偏好, 習慣) matches, else skip. Type: URL → reference; deadline/release/
 milestone/專案/截止/上線 → project; always/never/don't/不要/總是/別 → feedback; else user.
@@ -231,8 +234,8 @@ Eligible: not pinned, role ≠ system, `turn ≤ current − keepRecentTurns`.
 Plan: ratio < softRatio and not force → settled `compact: false` (`under the soft limit`); no
 eligible → settled `compact: false` (`nothing eligible`). Asked = eligible by tokens desc, first
 `maxSegmentsAsked` (the rest default to keep). State `{ goal: excerpt 1000, usage: {tokens,
-window}, segments: [{id: g<i>, role, age: current − turn, tokens, text: excerpt excerptChars,
-keepTail}] }`. Questions: predicate `compact_now` only when ratio < hardRatio and not force;
+window}, segments: [{id: g<i>, role, age: current − turn, tokens, text: excerpt excerptChars
+(head and tail kept)}] }`. Questions: predicate `compact_now` only when ratio < hardRatio and not force;
 choice `g<i>` (keep, summarize, drop) per asked segment.
 
 Interpret: compact = force || ratio ≥ hard || p(compact_now) ≥ 0.5; actions `{segmentId: keep|
@@ -242,8 +245,12 @@ mean choice confidence.
 Gate (the engine runs gate only after Gemini; `heuristic` calls the same exported escalation
 helper `escalate(actions, input, cfg)` itself): estimate tokens after actions (summarize → `min(tokens,
 estimateTokens(summary))` with summary length ≤ summaryChars; drop → 0). While above
-`targetRatio × window`, walk eligible segments oldest first: keep → summarize; then a second pass
-summarize → drop for `tool` segments. Changes → source `gemini+rules`.
+`targetRatio × window`, four passes run in order, each oldest first: keep → summarize for `tool`
+segments; keep → summarize for `assistant` segments; summarize → drop for `tool` segments; and, as
+a last resort, keep → summarize for `user` segments. The first user segment (lowest turn) is never
+changed by the rules. Before escalating, gate also limits Gemini's answers: a `drop` on a user
+segment becomes `summarize`, and any action on the first user segment becomes `keep`. Changes →
+source `gemini+rules`. Every result carries `targetMet` (`ratioAfter ≤ targetRatio`).
 
 Heuristic: compact = force || ratio ≥ softRatio. Actions: tool older than 6 turns → drop; tool >
 500 tokens → summarize; assistant > 800 tokens → summarize; else keep; then escalate as above.
@@ -280,28 +287,58 @@ CLI (JSON to stdout, errors to stderr, exit 1 on error, 2 on usage):
 tokens), `route --task T [--context-tokens N] [--requires a,b] [--local-only]`, `skills --task T
 [--dir D ...]`, `retrieve --query Q [--root R] [--budget N] [--force]`, `recall --query Q`,
 `remember --text T [--source user] [--dry-run]`, `compress --file transcript.json` (input object
-JSON), `serve [--port N]`, `mcp`, `config` (effective config without the key), `--mode`,
+JSON), `memories` (every stored memory), `forget --id ID` (remove one; exit 1 when unknown),
+`serve [--port N]`, `mcp`, `config` (effective config without the key), `--mode`,
 `--config`, `--version`, `--help`. Loads env files first.
 
 HTTP: `GET /health` → `{ok, version, mode}`; `POST /v1/decide/:kind` JSON body → Decision; `GET
 /v1/stats`. Binds 127.0.0.1 by default; rejects any `Origin` header with 403 before dispatch.
 Decision requests require `Content-Type: application/json` (charset parameters accepted),
-otherwise 415. Body limit 1 MB (413); 400 on bad JSON/invalid input, 404 unknown route,
+otherwise 415. When bound to loopback, a `Host` header naming any other host is also answered 403
+(DNS rebinding); the check follows the address the socket actually binds, not `server.host`, so a
+`startHttp` host override changes it, and it stays on until the server is listening. Body limit `server.maxBodyBytes`, default 8 MB (413); 400 on bad JSON/invalid input, 404 unknown route,
 502 on a strict-mode Gemini error, 500 on local IO/other failures in every mode.
 
 MCP (stdio, JSON-RPC 2.0, newline-delimited, protocol `2025-06-18`): `initialize`,
 `notifications/initialized`, `tools/list`, `tools/call`, `ping`. Tools `gemini_route`,
 `gemini_skills`, `gemini_retrieve`, `gemini_recall`, `gemini_remember`, `gemini_compress`, closed JSON
 schemas (`additionalProperties: false`). Result `content: [{type: 'text', text: JSON}]`,
-`isError: true` on failure. Nothing but JSON-RPC on stdout.
+`isError: true` on failure. Nothing but JSON-RPC on stdout. Tools carry annotations: all are
+`readOnlyHint: true` except `gemini_remember`, which is marked destructive (an update replaces
+the stored text).
 
 ## 7. Safety
 
 - The API key only from env; never logged, never in config output, never in the ledger. It is
   a non-enumerable config property; Gemini error bodies have it replaced by `[key]` (`scrub`).
-- Config trust: `gemini.url`, `memory.path`, `ledger.path`, `skills.dirs`, `retrieve.allowedRoots`, `server.host`
+- Config trust: `gemini.url`, `memory.path`, `ledger.path`, `ledger.enabled`, `skills.dirs`, `retrieve.allowedRoots`, `retrieve.respectGitignore`, `server.host`
   are accepted only from an explicit config file, `GEMINI_CORE_CONFIG` or the home config, never
   from a working-folder `gemini-core.config.json`. `gemini.url` must be https or loopback.
+- Config is strict: an unknown key, or a section that is not an object, in a file or in
+  `overrides`, is an error that names it.
+- The repository index honours `.gitignore` files inside the root (`retrieve.respectGitignore`,
+  default true): deeper files override shallower ones, the last matching rule wins, and an ignored
+  folder is not entered. Only `.gitignore` is read (not `.git/info/exclude` or global excludes) and
+  `git` is never run, since a repository's own config can make git execute commands. A
+  `.gitignore` that exists but cannot be used counts in `skipped`. The index reports `ignored`.
+  Matching folds ASCII letter case on Windows and macOS, like git's `core.ignorecase` default, and
+  is case-sensitive elsewhere. Bracket expressions support the POSIX classes (`[[:digit:]]` and
+  the rest); an unknown class name makes the rule never match, as in git.
+- `createRepoIndexAsync` builds the same index while yielding to the event loop; the engine uses
+  it, concurrent requests for one root share one build, and a failed build is not cached.
+- Memory writes are flushed before the rename; `update` and `remove` append the prior record to
+  `<file>.history`; a lock is released only by the process whose token it holds; the store, its
+  side files and the ledger are created owner-only (0600) on POSIX.
+- The ledger rotates to `<file>.1` past `ledger.maxBytes` (default 10 MB). The full file is first
+  moved aside under a private name and replaces `<file>.1` only if it is still over the limit, so
+  two processes rotating at once cannot overwrite the kept file. A failed rotation is reported
+  once and the record is still appended.
+- Text is redacted before it is cut for the Gemini state, so a cut cannot split a secret.
+- Request input is trusted less than config: a skills `dirs` entry must lie in `skills.dirs` or
+  the working folder, by resolved and by real path, like a retrieve `root`. Real paths are
+  compared exactly; on Windows the name-only pre-check ignores ASCII letter case only, so a folder
+  whose name has non-ASCII letters must be spelled with the same case as in the config. The CLI's `--dir`
+  adds its folders to `skills.dirs`, since the person at the command line is trusted.
 - Memory refuses secrets (contract `SECRET`) both in Gemini state and on disk.
 - Ledger stores no user text.
 - The HTTP server binds loopback by default.
