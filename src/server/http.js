@@ -54,9 +54,10 @@ function readBody(req, limit) {
       if (tooLarge) return;
       size += chunk.length;
       if (size > limit) {
+        // Answering now would close the socket under a client that is still sending (a reset
+        // on Windows, and the 413 is lost), so the answer waits for 'end'.
         tooLarge = true;
         chunks = [];
-        resolve(null);
         return;
       }
       chunks.push(chunk);
